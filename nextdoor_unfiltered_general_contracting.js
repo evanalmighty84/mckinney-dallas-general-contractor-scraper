@@ -193,6 +193,29 @@ function isRetryablePageError(error) {
     );
 }
 
+function shuffleArray(items) {
+    const shuffled = [...items];
+
+    for (
+        let index = shuffled.length - 1;
+        index > 0;
+        index -= 1
+    ) {
+        const swapIndex =
+            Math.floor(Math.random() * (index + 1));
+
+        [
+            shuffled[index],
+            shuffled[swapIndex],
+        ] = [
+            shuffled[swapIndex],
+            shuffled[index],
+        ];
+    }
+
+    return shuffled;
+}
+
 async function configurePage(page, label) {
     page.setDefaultTimeout(PAGE_DEFAULT_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(
@@ -486,20 +509,33 @@ async function getCurrentNextdoorPage(context) {
 
 async function findVisibleSearchBox(page) {
     const selectors = [
+        '#search-input-field',
         'input[aria-label="Search Nextdoor"]',
         'input[placeholder*="Search Nextdoor" i]',
+        'input[placeholder^="Search for " i]',
         'input[type="search"]',
         '[data-testid="search-input"] input',
     ];
 
     for (const selector of selectors) {
-        const candidate = page.locator(selector).first();
+        const matches = page.locator(selector);
 
-        if (
-            (await candidate.count().catch(() => 0)) &&
-            (await candidate.isVisible().catch(() => false))
-        ) {
-            return candidate;
+        const count = await matches.count().catch(() => 0);
+
+        for (let index = 0; index < count; index += 1) {
+            const candidate = matches.nth(index);
+
+            if (
+                await candidate.isVisible().catch(() => false)
+            ) {
+                console.log(
+                    `✅ Found visible Nextdoor search input ` +
+                    `with selector "${selector}" ` +
+                    `(match ${index + 1}/${count}).`,
+                );
+
+                return candidate;
+            }
         }
     }
 
@@ -1043,6 +1079,83 @@ async function searchNextdoor(page, query) {
 
     let searchBox = await findVisibleSearchBox(page);
 
+    // ---------------------------------------------------------
+    // NEW:
+    // Some Nextdoor profiles render a collapsed search control.
+    // The real:
+    //
+    //   <input aria-label="Search Nextdoor">
+    //
+    // is not added to the DOM until that control is clicked.
+    //
+    // IMPORTANT:
+    // We only do this if the existing search-box detection failed,
+    // so profiles like Arlington Hardcore that already work continue
+    // using the old behavior unchanged.
+    // ---------------------------------------------------------
+
+    if (!searchBox) {
+        console.log(
+            "🔎 Search input is not mounted yet; trying to activate " +
+            "the collapsed Nextdoor search control...",
+        );
+
+        const searchTriggerCandidates = [
+            // Accessible button/interactive variants
+            page.getByRole("button", { name: /search/i }).first(),
+
+            // Any current/future Nextdoor search wrapper
+            page.locator('[aria-label*="Search" i]').first(),
+            page.locator('[data-testid*="search" i]').first(),
+
+            // Visible collapsed text such as:
+            // "Search for Roof Repair"
+            page.getByText(/^Search for\b/i).first(),
+        ];
+
+        for (let index = 0; index < searchTriggerCandidates.length; index += 1) {
+            const candidate = searchTriggerCandidates[index];
+
+            try {
+                if (
+                    (await candidate.count().catch(() => 0)) &&
+                    (await candidate.isVisible().catch(() => false))
+                ) {
+                    console.log(
+                        `🖱️ Clicking search trigger candidate ${index + 1}...`,
+                    );
+
+                    await candidate.click({
+                        timeout: 3_000,
+                    });
+
+                    // Give Nextdoor a moment to mount the real input.
+                    await sleep(750);
+
+                    searchBox = await findVisibleSearchBox(page);
+
+                    if (searchBox) {
+                        console.log(
+                            "✅ Nextdoor search input appeared after activation.",
+                        );
+                        break;
+                    }
+                }
+            } catch (error) {
+                console.log(
+                    `ℹ️ Search trigger candidate ${index + 1} did not work: ` +
+                    `${error.message}`,
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // EXISTING WAIT:
+    // If the search box still isn't available, give Nextdoor time
+    // to finish rendering just like before.
+    // ---------------------------------------------------------
+
     if (!searchBox) {
         console.log(
             `⏳ Search bar is not visible yet; waiting up to ` +
@@ -1053,7 +1166,30 @@ async function searchNextdoor(page, query) {
 
         while (Date.now() < deadline && !searchBox) {
             await sleep(1_500);
+
             searchBox = await findVisibleSearchBox(page);
+
+            // During the wait, try once more to activate a collapsed
+            // search control if the input still hasn't mounted.
+            if (!searchBox) {
+                const collapsedTrigger =
+                    page.getByRole("button", { name: /search/i }).first();
+
+                try {
+                    if (
+                        (await collapsedTrigger.count().catch(() => 0)) &&
+                        (await collapsedTrigger.isVisible().catch(() => false))
+                    ) {
+                        await collapsedTrigger.click({
+                            timeout: 2_000,
+                        });
+
+                        await sleep(500);
+
+                        searchBox = await findVisibleSearchBox(page);
+                    }
+                } catch {}
+            }
         }
     }
 
@@ -2773,6 +2909,17 @@ async function main() {
         await purgeExpiredSearchHistory();
 
         const strategy = await buildAdaptiveSearchPlan();
+        const randomizedPlan = shuffleArray(strategy.plan);
+
+        console.log(
+            `🔀 Randomized ${randomizedPlan.length} GC search terms for this run.`,
+        );
+
+
+        console.log(
+            "🔀 Search order this run:",
+            randomizedPlan.map((entry) => entry.query),
+        );
 
         await createSearchRun(runId, strategy);
 
@@ -2812,10 +2959,10 @@ async function main() {
 
         for (
             let termIndex = 0;
-            termIndex < strategy.plan.length;
+            termIndex < randomizedPlan.length;
             termIndex += 1
         ) {
-            const entry = strategy.plan[termIndex];
+            const entry = randomizedPlan[termIndex];
             const query = entry.query;
             const termSource = entry.source;
 
@@ -2831,7 +2978,7 @@ async function main() {
             console.log("");
             console.log("############################################################");
             console.log(
-                `🔎 SEARCH ${termIndex + 1}/${strategy.plan.length}: ` +
+                `🔎 SEARCH ${termIndex + 1}/${randomizedPlan.length}: ` +
                 `"${query}" [${termSource}]`,
             );
             printTermHistory(query, strategy.performanceByTerm);
@@ -2881,7 +3028,6 @@ async function main() {
         );
         console.log("✅ Adaptive general contracting scrape finished.");
         console.log(`   Run ID: ${runId}`);
-        console.log(`   Search terms: ${strategy.plan.length}`);
         console.log(
             `   Result observations logged: ${totals.resultObservations}`,
         );
