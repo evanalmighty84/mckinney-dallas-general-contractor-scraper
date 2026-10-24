@@ -21,8 +21,38 @@ const CRM_API_BASE_URL =
     process.env.CRM_API_BASE_URL ||
     "http://ftn-enrichment.railway.internal:8080";
 
+const NEXTDOOR_QUEUE_API_BASE_URL =
+    process.env.NEXTDOOR_QUEUE_API_BASE_URL ||
+    "https://crm-function-app-5d4de511071d.herokuapp.com/server/lead_function/api/nextdoor";
+
+const NEXTDOOR_QUEUE_SCRAPER_KEY =
+    "general_contracting";
+
+const NEXTDOOR_QUEUE_SCRAPER_NAME =
+    "McKinney Dallas General Contractor Scraper";
+
 const MAX_POSTS_PER_TERM = Number(
     process.env.GENERAL_CONTRACTING_MAX_POSTS || 50,
+);
+
+const TERM_DELAY_MIN_MS = Math.max(
+    2_000,
+    Number(process.env.GC_TERM_DELAY_MIN_MS || 5_000),
+);
+
+const TERM_DELAY_MAX_MS = Math.max(
+    TERM_DELAY_MIN_MS,
+    Number(process.env.GC_TERM_DELAY_MAX_MS || 9_000),
+);
+
+const DETAIL_WEIGHT_DELAY_MS = Math.max(
+    0,
+    Number(process.env.GC_DETAIL_WEIGHT_DELAY_MS || 1_500),
+);
+
+const DETAIL_WEIGHT_DELAY_CAP_MS = Math.max(
+    0,
+    Number(process.env.GC_DETAIL_WEIGHT_DELAY_CAP_MS || 12_000),
 );
 
 const FALLBACK_STATE =
@@ -173,6 +203,235 @@ function getErrorMessage(error) {
     return error?.message || String(error || "Unknown error");
 }
 
+function shuffleArray(items) {
+    const shuffled = [...items];
+
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+        const swapIndex = Math.floor(Math.random() * (index + 1));
+        [shuffled[index], shuffled[swapIndex]] = [
+            shuffled[swapIndex],
+            shuffled[index],
+        ];
+    }
+
+    return shuffled;
+}
+
+function getAdaptiveTermDelayMs(result = {}) {
+    const baseRange = Math.max(
+        0,
+        TERM_DELAY_MAX_MS - TERM_DELAY_MIN_MS,
+    );
+
+    const base =
+        TERM_DELAY_MIN_MS +
+        Math.floor(Math.random() * (baseRange + 1));
+
+    const detailLoad = Math.min(
+        DETAIL_WEIGHT_DELAY_CAP_MS,
+        Math.max(0, Number(result.newCandidates || 0)) *
+            DETAIL_WEIGHT_DELAY_MS,
+    );
+
+    return base + detailLoad;
+}
+
+function parseNextdoorThrottleMessage(text = "") {
+    const match = String(text).match(
+        /Throttled,\s*wait\s*(\d+)\s*seconds\.?/i,
+    );
+
+    if (!match) return null;
+
+    return {
+        waitSeconds: Number(match[1]),
+        message: match[0],
+    };
+}
+
+function isNextdoorThrottleError(error) {
+    return /^NEXTDOOR_THROTTLED:/i.test(getErrorMessage(error));
+}
+
+async function detectNextdoorThrottle(page) {
+    const bodyText = await page
+        .locator("body")
+        .innerText()
+        .catch(() => "");
+
+    return parseNextdoorThrottleMessage(bodyText);
+}
+
+function nextdoorQueueEndpoint(pathname) {
+    return NEXTDOOR_QUEUE_API_BASE_URL.replace(/\/$/, "") + pathname;
+}
+
+async function fetchCarryoverSearchTerms() {
+    if (!NEXTDOOR_QUEUE_API_BASE_URL) {
+        console.log("ℹ️ Nextdoor queue API is not configured; continuing without carryover terms.");
+        return [];
+    }
+
+    const endpointUrl = nextdoorQueueEndpoint(
+        `/search-queue/${encodeURIComponent(NEXTDOOR_QUEUE_SCRAPER_KEY)}`,
+    );
+
+    try {
+        console.log(`♻️ Loading unfinished Nextdoor search terms → ${endpointUrl}`);
+
+        const response = await fetch(endpointUrl, {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(
+                Math.max(
+                    5000,
+                    Number(process.env.NEXTDOOR_QUEUE_TIMEOUT_MS || 20000),
+                ),
+            ),
+        });
+
+        const responseText = await response.text();
+
+        if (!response.ok) {
+            throw new Error(
+                `Queue GET returned HTTP ${response.status}: ` +
+                responseText.slice(0, 500),
+            );
+        }
+
+        const body = responseText ? JSON.parse(responseText) : {};
+        const rawTerms = Array.isArray(body?.pending_terms)
+            ? body.pending_terms
+            : [];
+
+        const entries = [];
+        const seen = new Set();
+
+        for (const entry of rawTerms) {
+            const query = cleanText(
+                typeof entry === "string"
+                    ? entry
+                    : entry?.query || entry?.search_term || "",
+            );
+            const key = normalizeSearchTerm(query);
+
+            if (!query || !key || seen.has(key)) continue;
+
+            seen.add(key);
+            entries.push({
+                query,
+                source:
+                    typeof entry === "object" && entry?.source
+                        ? cleanText(entry.source)
+                        : "carryover",
+            });
+        }
+
+        console.log(`♻️ Loaded ${entries.length} unfinished general contractor term(s).`);
+        return entries;
+    } catch (error) {
+        console.warn(
+            "⚠️ Could not load general contractor carryover queue; continuing with the normal adaptive plan: " +
+            getErrorMessage(error),
+        );
+        return [];
+    }
+}
+
+async function saveThrottleCarryover({
+    runId,
+    throttledTerm,
+    waitSeconds,
+    remainingTerms,
+}) {
+    if (!NEXTDOOR_QUEUE_API_BASE_URL) return false;
+
+    const endpointUrl = nextdoorQueueEndpoint("/search-queue/throttled");
+
+    try {
+        const response = await fetch(endpointUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                scraper_key: NEXTDOOR_QUEUE_SCRAPER_KEY,
+                scraper_name: NEXTDOOR_QUEUE_SCRAPER_NAME,
+                run_id: runId,
+                throttled_term: throttledTerm,
+                wait_seconds: waitSeconds || null,
+                remaining_terms: remainingTerms.map((entry) => ({
+                    query: entry.query,
+                    source: entry.source || "unknown",
+                })),
+            }),
+            signal: AbortSignal.timeout(
+                Math.max(
+                    5000,
+                    Number(process.env.NEXTDOOR_QUEUE_TIMEOUT_MS || 20000),
+                ),
+            ),
+        });
+
+        const responseText = await response.text();
+        if (!response.ok) {
+            throw new Error(
+                `Queue POST returned HTTP ${response.status}: ` +
+                responseText.slice(0, 500),
+            );
+        }
+
+        console.log(
+            `♻️ Saved ${remainingTerms.length} unfinished general contractor term(s) to the backend carryover queue.`,
+        );
+        return true;
+    } catch (error) {
+        console.error(
+            "⚠️ Could not save general contractor carryover queue before exit: " +
+            getErrorMessage(error),
+        );
+        return false;
+    }
+}
+
+async function clearCarryoverSearchTerms(runId) {
+    if (!NEXTDOOR_QUEUE_API_BASE_URL) return false;
+
+    const endpointUrl = nextdoorQueueEndpoint("/search-queue/completed");
+
+    try {
+        const response = await fetch(endpointUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                scraper_key: NEXTDOOR_QUEUE_SCRAPER_KEY,
+                run_id: runId,
+            }),
+            signal: AbortSignal.timeout(
+                Math.max(
+                    5000,
+                    Number(process.env.NEXTDOOR_QUEUE_TIMEOUT_MS || 20000),
+                ),
+            ),
+        });
+
+        const responseText = await response.text();
+        if (!response.ok) {
+            throw new Error(
+                `Queue completion POST returned HTTP ${response.status}: ` +
+                responseText.slice(0, 500),
+            );
+        }
+
+        console.log("✅ Cleared general contractor carryover queue after full search completion.");
+        return true;
+    } catch (error) {
+        console.warn(
+            "⚠️ Could not clear general contractor carryover queue: " +
+            getErrorMessage(error),
+        );
+        return false;
+    }
+}
+
 function isTargetCrashError(error) {
     return TARGET_CRASH_PATTERN.test(getErrorMessage(error));
 }
@@ -191,29 +450,6 @@ function isRetryablePageError(error) {
         /target page, context or browser has been closed/i.test(message) ||
         /navigation failed|net::err_|timeout/i.test(message)
     );
-}
-
-function shuffleArray(items) {
-    const shuffled = [...items];
-
-    for (
-        let index = shuffled.length - 1;
-        index > 0;
-        index -= 1
-    ) {
-        const swapIndex =
-            Math.floor(Math.random() * (index + 1));
-
-        [
-            shuffled[index],
-            shuffled[swapIndex],
-        ] = [
-            shuffled[swapIndex],
-            shuffled[index],
-        ];
-    }
-
-    return shuffled;
 }
 
 async function configurePage(page, label) {
@@ -252,6 +488,16 @@ async function configurePage(page, label) {
                 `ℹ️ Suppressed ${suppressedPageErrors} harmless ` +
                 `network/ad page error(s) for ${label}.`,
             );
+        }
+    });
+
+    page.on("response", (response) => {
+        if (response.status() !== 429) return;
+
+        const responseUrl = response.url();
+
+        if (/nextdoor\.com/i.test(responseUrl)) {
+            console.error(`🌐 HTTP 429 (${label}): ${responseUrl}`);
         }
     });
 
@@ -379,6 +625,58 @@ process.on("uncaughtException", (error) => {
 
 function cleanText(value = "") {
     return String(value).replace(/\s+/g, " ").trim();
+}
+
+function parseNextdoorPostTimestamp(value, now = new Date()) {
+    const raw = cleanText(value);
+    if (!raw) return null;
+
+    const lower = raw.toLowerCase();
+    const date = new Date(now);
+
+    if (/^today$/i.test(raw)) return date.toISOString();
+
+    if (/^yesterday$/i.test(raw)) {
+        date.setDate(date.getDate() - 1);
+        return date.toISOString();
+    }
+
+    let match = lower.match(/^(\d+)\s*(?:min|mins|minute|minutes)\s*ago$/i);
+    if (match) {
+        date.setMinutes(date.getMinutes() - Number(match[1]));
+        return date.toISOString();
+    }
+
+    match = lower.match(/^(\d+)\s*(?:hr|hrs|hour|hours)\s*ago$/i);
+    if (match) {
+        date.setHours(date.getHours() - Number(match[1]));
+        return date.toISOString();
+    }
+
+    match = lower.match(/^(\d+)\s*(?:d|day|days)\s*(?:ago)?$/i);
+    if (match) {
+        date.setDate(date.getDate() - Number(match[1]));
+        return date.toISOString();
+    }
+
+    match = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})(?:\s+(\d{4}))?$/);
+    if (match) {
+        const day = Number(match[1]);
+        const monthName = match[2];
+        let year = match[3] ? Number(match[3]) : now.getFullYear();
+        let parsed = new Date(monthName + " " + day + ", " + year + " 12:00:00");
+
+        if (Number.isNaN(parsed.getTime())) return null;
+
+        if (!match[3] && parsed.getTime() > now.getTime() + 7 * 86400000) {
+            year -= 1;
+            parsed = new Date(monthName + " " + day + ", " + year + " 12:00:00");
+        }
+
+        return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+    }
+
+    return null;
 }
 
 function normalizePostUrl(url) {
@@ -509,33 +807,20 @@ async function getCurrentNextdoorPage(context) {
 
 async function findVisibleSearchBox(page) {
     const selectors = [
-        '#search-input-field',
         'input[aria-label="Search Nextdoor"]',
         'input[placeholder*="Search Nextdoor" i]',
-        'input[placeholder^="Search for " i]',
         'input[type="search"]',
         '[data-testid="search-input"] input',
     ];
 
     for (const selector of selectors) {
-        const matches = page.locator(selector);
+        const candidate = page.locator(selector).first();
 
-        const count = await matches.count().catch(() => 0);
-
-        for (let index = 0; index < count; index += 1) {
-            const candidate = matches.nth(index);
-
-            if (
-                await candidate.isVisible().catch(() => false)
-            ) {
-                console.log(
-                    `✅ Found visible Nextdoor search input ` +
-                    `with selector "${selector}" ` +
-                    `(match ${index + 1}/${count}).`,
-                );
-
-                return candidate;
-            }
+        if (
+            (await candidate.count().catch(() => 0)) &&
+            (await candidate.isVisible().catch(() => false))
+        ) {
+            return candidate;
         }
     }
 
@@ -921,21 +1206,30 @@ async function applyDistanceFilter(page, targetMiles = 15) {
     return false;
 }
 
-async function applyTodayFilter(page) {
-    console.log('🗓️ Applying "Today" date filter...');
+function getDateFilterForTermSource(termSource) {
+    return ["sonar", "fallback", "carryover"].includes(termSource)
+        ? "This Week"
+        : "Today";
+}
+
+function getDateFilterParam(targetLabel) {
+    return targetLabel === "This Week" ? "THIS_WEEK" : "TODAY";
+}
+
+async function applyDateFilter(page, targetLabel) {
+    console.log(`🗓️ Applying "${targetLabel}" date filter...`);
+
+    const anyDateLabel =
+        /^(All Time|Today|This Week|This Month|This Year)$/i;
+    const exactTarget = targetLabel === "This Week"
+        ? /^This Week$/i
+        : /^Today$/i;
 
     const triggerCandidates = [
-        page
-            .getByRole("button", {
-                name: /^(All Time|Today|This Week|This Month|This Year)$/i,
-            })
-            .first(),
+        page.getByRole("button", { name: anyDateLabel }).first(),
         page
             .locator("button, [role=button]")
-            .filter({
-                hasText:
-                    /^(All Time|Today|This Week|This Month|This Year)$/i,
-            })
+            .filter({ hasText: anyDateLabel })
             .first(),
     ];
 
@@ -952,43 +1246,61 @@ async function applyTodayFilter(page) {
     }
 
     if (!trigger) {
-        console.log("ℹ️ Could not find the date filter.");
-        return false;
+        throw new Error("DATE_FILTER_NOT_FOUND:" + targetLabel);
     }
 
-    const currentText = cleanText(await trigger.innerText().catch(() => ""));
+    const before = cleanText(await trigger.innerText().catch(() => ""));
 
-    if (/^today$/i.test(currentText)) {
-        console.log('✅ Date was already set to "Today".');
-        return true;
-    }
+    if (!exactTarget.test(before)) {
+        await trigger.click();
+        await sleep(500);
 
-    await trigger.click();
-    await sleep(500);
+        const optionCandidates = [
+            page.getByRole("menuitem", { name: exactTarget }).first(),
+            page.getByRole("option", { name: exactTarget }).first(),
+            page.getByText(exactTarget).last(),
+        ];
 
-    const optionCandidates = [
-        page.getByRole("menuitem", { name: /^Today$/i }).first(),
-        page.getByRole("option", { name: /^Today$/i }).first(),
-        page.getByText(/^Today$/i).last(),
-    ];
+        let clicked = false;
 
-    for (const option of optionCandidates) {
-        if (
-            (await option.count().catch(() => 0)) &&
-            (await option.isVisible().catch(() => false))
-        ) {
-            await option.click();
-            await sleep(1_000);
-            console.log('✅ Applied "Today".');
-            return true;
+        for (const option of optionCandidates) {
+            if (
+                (await option.count().catch(() => 0)) &&
+                (await option.isVisible().catch(() => false))
+            ) {
+                await option.click();
+                clicked = true;
+                break;
+            }
         }
+
+        if (!clicked) {
+            throw new Error("DATE_FILTER_OPTION_NOT_FOUND:" + targetLabel);
+        }
+
+        await sleep(1_200);
     }
 
-    console.log('ℹ️ Could not find the "Today" option.');
-    return false;
-}
+    const verifyTrigger = page
+        .locator("button, [role=button]")
+        .filter({ hasText: anyDateLabel })
+        .first();
 
-async function applySearchFiltersByUrl(page, query) {
+    const after = cleanText(
+        await verifyTrigger.innerText().catch(() => ""),
+    );
+
+    if (!exactTarget.test(after)) {
+        throw new Error(
+            "DATE_FILTER_NOT_APPLIED: expected " + targetLabel +
+            ", saw \"" + (after || "unknown") + "\"",
+        );
+    }
+
+    console.log(`✅ Visible Nextdoor date filter verified: ${targetLabel}`);
+    return true;
+}
+async function applySearchFiltersByUrl(page, query, targetDateLabel) {
     const currentUrl = new URL(page.url());
 
     if (!/(^|\.)nextdoor\.com$/i.test(currentUrl.hostname)) {
@@ -1015,13 +1327,15 @@ async function applySearchFiltersByUrl(page, query) {
     );
     currentUrl.searchParams.set(
         "postDateFilter",
-        "TODAY",
+        getDateFilterParam(targetDateLabel),
     );
 
     const targetUrl = currentUrl.toString();
 
     console.log("🔗 Applying search filters through the URL:");
-    console.log("   Posts + Most Recent + 15 miles + Today");
+    console.log(
+        `   Posts + Most Recent + 15 miles + ${targetDateLabel}`,
+    );
     console.log(`   ${targetUrl}`);
 
     await page.goto(targetUrl, {
@@ -1055,7 +1369,7 @@ async function applySearchFiltersByUrl(page, query) {
         applied.postSortOrder === "SORT_BY_RECENCY" &&
         applied.postDistance === "15" &&
         applied.postDistanceUnit === "MILES" &&
-        applied.postDateFilter === "TODAY";
+        applied.postDateFilter === getDateFilterParam(targetDateLabel);
 
     if (!filtersAreCorrect) {
         throw new Error(
@@ -1064,7 +1378,7 @@ async function applySearchFiltersByUrl(page, query) {
     }
 }
 
-async function searchNextdoor(page, query) {
+async function searchNextdoor(page, query, targetDateLabel) {
     console.log("");
     console.log("============================================================");
     console.log(`🔍 Searching Nextdoor for "${query}"...`);
@@ -1079,83 +1393,6 @@ async function searchNextdoor(page, query) {
 
     let searchBox = await findVisibleSearchBox(page);
 
-    // ---------------------------------------------------------
-    // NEW:
-    // Some Nextdoor profiles render a collapsed search control.
-    // The real:
-    //
-    //   <input aria-label="Search Nextdoor">
-    //
-    // is not added to the DOM until that control is clicked.
-    //
-    // IMPORTANT:
-    // We only do this if the existing search-box detection failed,
-    // so profiles like Arlington Hardcore that already work continue
-    // using the old behavior unchanged.
-    // ---------------------------------------------------------
-
-    if (!searchBox) {
-        console.log(
-            "🔎 Search input is not mounted yet; trying to activate " +
-            "the collapsed Nextdoor search control...",
-        );
-
-        const searchTriggerCandidates = [
-            // Accessible button/interactive variants
-            page.getByRole("button", { name: /search/i }).first(),
-
-            // Any current/future Nextdoor search wrapper
-            page.locator('[aria-label*="Search" i]').first(),
-            page.locator('[data-testid*="search" i]').first(),
-
-            // Visible collapsed text such as:
-            // "Search for Roof Repair"
-            page.getByText(/^Search for\b/i).first(),
-        ];
-
-        for (let index = 0; index < searchTriggerCandidates.length; index += 1) {
-            const candidate = searchTriggerCandidates[index];
-
-            try {
-                if (
-                    (await candidate.count().catch(() => 0)) &&
-                    (await candidate.isVisible().catch(() => false))
-                ) {
-                    console.log(
-                        `🖱️ Clicking search trigger candidate ${index + 1}...`,
-                    );
-
-                    await candidate.click({
-                        timeout: 3_000,
-                    });
-
-                    // Give Nextdoor a moment to mount the real input.
-                    await sleep(750);
-
-                    searchBox = await findVisibleSearchBox(page);
-
-                    if (searchBox) {
-                        console.log(
-                            "✅ Nextdoor search input appeared after activation.",
-                        );
-                        break;
-                    }
-                }
-            } catch (error) {
-                console.log(
-                    `ℹ️ Search trigger candidate ${index + 1} did not work: ` +
-                    `${error.message}`,
-                );
-            }
-        }
-    }
-
-    // ---------------------------------------------------------
-    // EXISTING WAIT:
-    // If the search box still isn't available, give Nextdoor time
-    // to finish rendering just like before.
-    // ---------------------------------------------------------
-
     if (!searchBox) {
         console.log(
             `⏳ Search bar is not visible yet; waiting up to ` +
@@ -1166,30 +1403,7 @@ async function searchNextdoor(page, query) {
 
         while (Date.now() < deadline && !searchBox) {
             await sleep(1_500);
-
             searchBox = await findVisibleSearchBox(page);
-
-            // During the wait, try once more to activate a collapsed
-            // search control if the input still hasn't mounted.
-            if (!searchBox) {
-                const collapsedTrigger =
-                    page.getByRole("button", { name: /search/i }).first();
-
-                try {
-                    if (
-                        (await collapsedTrigger.count().catch(() => 0)) &&
-                        (await collapsedTrigger.isVisible().catch(() => false))
-                    ) {
-                        await collapsedTrigger.click({
-                            timeout: 2_000,
-                        });
-
-                        await sleep(500);
-
-                        searchBox = await findVisibleSearchBox(page);
-                    }
-                } catch {}
-            }
         }
     }
 
@@ -1205,25 +1419,37 @@ async function searchNextdoor(page, query) {
     await page.waitForLoadState("domcontentloaded").catch(() => {});
     await sleep(3_000);
 
-    // The normal search creates Nextdoor's current ssid/search parameters.
-    // Reuse that URL and append the exact filters first. If Nextdoor changes
-    // or strips those parameters, fall back to the visible Posts/filter controls.
+    // URL state alone is not trusted. We still navigate with the requested
+    // parameters, then physically click and verify the visible controls.
     try {
-        await applySearchFiltersByUrl(page, query);
+        await applySearchFiltersByUrl(page, query, targetDateLabel);
     } catch (error) {
-        console.warn(
-            `⚠️ URL filters failed: ${error.message}`,
+        console.warn(`⚠️ URL filter navigation failed: ${error.message}`);
+    }
+
+    await goToPostsTab(page, query);
+    await applyMostRecentFilter(page);
+
+    const distanceApplied = await applyDistanceFilter(page, 15);
+
+    if (!distanceApplied) {
+        throw new Error("DISTANCE_FILTER_NOT_APPLIED:15 miles");
+    }
+
+    await applyDateFilter(page, targetDateLabel);
+    await sleep(1_800);
+
+    const throttle = await detectNextdoorThrottle(page);
+
+    if (throttle) {
+        console.error(
+            `⛔ Nextdoor throttled search for "${query}". ` +
+            `Requested wait: ${throttle.waitSeconds} seconds.`,
         );
 
-        console.log(
-            "♻️ Falling back to the visible Posts and filter controls...",
+        throw new Error(
+            `NEXTDOOR_THROTTLED:${throttle.waitSeconds}:${query}`,
         );
-
-        await goToPostsTab(page, query);
-        await applyMostRecentFilter(page);
-        await applyDistanceFilter(page, 15);
-        await applyTodayFilter(page);
-        await sleep(1_800);
     }
 }
 
@@ -1256,7 +1482,6 @@ async function collectPostLinks(
 
     const raw = await page.evaluate((maxResults) => {
         const results = [];
-        const seen = new Set();
 
         const clean = (value = "") =>
             String(value).replace(/\s+/g, " ").trim();
@@ -1268,7 +1493,7 @@ async function collectPostLinks(
         for (const anchor of anchors) {
             const href = anchor.href;
 
-            if (!href || seen.has(href)) {
+            if (!href) {
                 continue;
             }
 
@@ -1323,6 +1548,7 @@ async function collectPostLinks(
             // ---------------------------------------------------------
 
             let location = null;
+            let postedAtText = null;
 
             const styledTexts = [
                 ...anchor.querySelectorAll(
@@ -1334,13 +1560,24 @@ async function collectPostLinks(
 
             for (const text of styledTexts) {
                 const match = text.match(
-                    /^(.+?),\s*([A-Z]{2})\s*·\s*/i,
+                    /^(.+?),\s*([A-Z]{2})\s*·\s*([^·]+)(?:\s*·|$)/i,
                 );
 
                 if (match) {
                     location =
                         `${clean(match[1])}, ${match[2].toUpperCase()}`;
+                    postedAtText = clean(match[3]);
                     break;
+                }
+
+                const locationOnly = text.match(
+                    /^(.+?),\s*([A-Z]{2})\s*·\s*/i,
+                );
+
+                if (locationOnly && !location) {
+                    location =
+                        `${clean(locationOnly[1])}, ` +
+                        locationOnly[2].toUpperCase();
                 }
             }
 
@@ -1380,15 +1617,14 @@ async function collectPostLinks(
                 continue;
             }
 
-            seen.add(href);
-
             results.push({
                 url: href,
                 preview: preview.slice(0, 1_500),
 
-                // NEW — authoritative search-result metadata
+                // Authoritative metadata from the same search card
                 author: author || null,
                 location: location || null,
+                posted_at_text: postedAtText || null,
             });
 
             if (results.length >= maxResults) {
@@ -1399,20 +1635,52 @@ async function collectPostLinks(
         return results;
     }, limit);
 
-    const unique = new Map();
+    const posts = [];
+    const collectedByUrl = new Map();
+    let sameCardDuplicates = 0;
+    let reusedUrlVariants = 0;
 
-    for (const post of raw) {
-        const normalizedUrl = normalizePostUrl(post.url);
+    for (const rawPost of raw) {
+        const post = {
+            ...rawPost,
+            url: normalizePostUrl(rawPost.url),
+        };
 
-        unique.set(normalizedUrl, {
-            ...post,
-            url: normalizedUrl,
-        });
+        const priorPosts = collectedByUrl.get(post.url) || [];
+
+        const duplicate = priorPosts.some((prior) =>
+            authorsCompatibleForDuplicate(
+                prior.author,
+                post.author,
+            ) &&
+            descriptionsLookLikeSamePost(
+                prior.preview,
+                post.preview,
+            )
+        );
+
+        if (duplicate) {
+            sameCardDuplicates += 1;
+            continue;
+        }
+
+        if (priorPosts.length > 0) {
+            reusedUrlVariants += 1;
+            console.warn(
+                `⚠️ Same search returned one URL with different card content: ${post.url}`,
+            );
+        }
+
+        priorPosts.push(post);
+        collectedByUrl.set(post.url, priorPosts);
+        posts.push(post);
     }
 
-    const posts = [...unique.values()];
-
-    console.log(`🔗 Found ${posts.length} unique posts.`);
+    console.log(
+        `🔗 Found ${posts.length} distinct post card(s); ` +
+        `${sameCardDuplicates} duplicate anchor/card(s) collapsed; ` +
+        `${reusedUrlVariants} reused-URL variant(s) preserved.`,
+    );
 
     for (const post of posts) {
         console.log(
@@ -1424,6 +1692,119 @@ async function collectPostLinks(
     return posts;
 }
 
+const OTHER_LEAD_TABLE =
+    "unfiltered_ins_mold_pest_housecl_plumb_paint_land_lawn_handy";
+
+function normalizeDuplicateText(value) {
+    return cleanText(value || "")
+        .toLowerCase()
+        .replace(/[“”"‘’']/g, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function descriptionsLookLikeSamePost(left, right) {
+    const a = normalizeDuplicateText(left);
+    const b = normalizeDuplicateText(right);
+
+    if (!a || !b) {
+        return false;
+    }
+
+    if (a === b) {
+        return true;
+    }
+
+    const shorter = a.length <= b.length ? a : b;
+    const longer = a.length <= b.length ? b : a;
+
+    // Handles edited posts where the newer version merely appends an
+    // update, while avoiding very short generic snippets.
+    if (shorter.length >= 30 && longer.includes(shorter)) {
+        return true;
+    }
+
+    const tokensA = new Set(
+        a.split(" ").filter((token) => token.length >= 3),
+    );
+    const tokensB = new Set(
+        b.split(" ").filter((token) => token.length >= 3),
+    );
+
+    if (!tokensA.size || !tokensB.size) {
+        return false;
+    }
+
+    let overlap = 0;
+
+    for (const token of tokensA) {
+        if (tokensB.has(token)) {
+            overlap += 1;
+        }
+    }
+
+    const smallerTokenCount = Math.min(
+        tokensA.size,
+        tokensB.size,
+    );
+
+    return (
+        smallerTokenCount >= 5 &&
+        overlap / smallerTokenCount >= 0.82
+    );
+}
+
+function authorsCompatibleForDuplicate(left, right) {
+    const a = normalizeDuplicateText(left);
+    const b = normalizeDuplicateText(right);
+
+    // The search card occasionally has no author. In that case the
+    // same URL + strong description match is still enough evidence.
+    if (!a || !b) {
+        return true;
+    }
+
+    return a === b;
+}
+
+function isCrossTermDuplicate(seenDuringRun, item) {
+    const url = normalizePostUrl(item.url || item.post_url);
+    const description =
+        item.preview || item.text || item.description || "";
+
+    const priorItems = seenDuringRun.get(url) || [];
+
+    const duplicate = priorItems.some((prior) =>
+        authorsCompatibleForDuplicate(
+            prior.author,
+            item.author,
+        ) &&
+        descriptionsLookLikeSamePost(
+            prior.description,
+            description,
+        )
+    );
+
+    if (duplicate) {
+        return true;
+    }
+
+    if (priorItems.length > 0) {
+        console.warn(
+            `⚠️ Same-run reused/mismatched URL not treated as cross-term duplicate: ${url}`,
+        );
+    }
+
+    priorItems.push({
+        author: item.author || null,
+        description,
+    });
+
+    seenDuringRun.set(url, priorItems);
+    return false;
+}
+
 async function getExistingUrls(posts) {
     const urls = posts.map((post) => normalizePostUrl(post.url));
 
@@ -1431,16 +1812,97 @@ async function getExistingUrls(posts) {
 
     const { rows } = await pool.query(
         `
-            SELECT post_url
+            SELECT
+                post_url,
+                author,
+                description,
+                'current'::text AS source
             FROM ${TABLE_NAME}
+            WHERE post_url = ANY($1::text[])
+
+            UNION ALL
+
+            SELECT
+                post_url,
+                author,
+                description,
+                'other'::text AS source
+            FROM ${OTHER_LEAD_TABLE}
             WHERE post_url = ANY($1::text[])
         `,
         [urls],
     );
 
-    return new Set(
-        rows.map((row) => normalizePostUrl(row.post_url)),
-    );
+    const postsByUrl = new Map();
+
+    for (const post of posts) {
+        const url = normalizePostUrl(post.url);
+
+        if (!postsByUrl.has(url)) {
+            postsByUrl.set(url, []);
+        }
+
+        postsByUrl.get(url).push(post);
+    }
+
+    const existingUrls = new Set();
+    let crossTableMatches = 0;
+    let reusedUrlMismatches = 0;
+
+    for (const row of rows) {
+        const url = normalizePostUrl(row.post_url);
+
+        /*
+         * This table has a post_url conflict constraint. Any URL already
+         * present here is occupied regardless of content; skipping it is
+         * safer than allowing a reused/misaligned URL to overwrite the
+         * existing row through ON CONFLICT.
+         */
+        if (row.source === "current") {
+            existingUrls.add(url);
+            continue;
+        }
+
+        const candidates = postsByUrl.get(url) || [];
+
+        const samePost = candidates.some((post) =>
+            authorsCompatibleForDuplicate(
+                row.author,
+                post.author,
+            ) &&
+            descriptionsLookLikeSamePost(
+                row.description,
+                post.preview,
+            )
+        );
+
+        if (samePost) {
+            existingUrls.add(url);
+            crossTableMatches += 1;
+        } else {
+            /*
+             * We have historical evidence that Nextdoor URLs can appear
+             * with materially different content. Do not suppress a new
+             * candidate solely because another table contains the URL.
+             */
+            reusedUrlMismatches += 1;
+        }
+    }
+
+    if (crossTableMatches > 0) {
+        console.log(
+            `🧱 Cross-table historical duplicate matches: ${crossTableMatches}.`,
+        );
+    }
+
+    if (reusedUrlMismatches > 0) {
+        console.warn(
+            `⚠️ Reused/mismatched Nextdoor URL(s) not treated as duplicates: ` +
+            `${reusedUrlMismatches}.`,
+        );
+    }
+
+    return existingUrls;
 }
 
 async function expandSeeMore(page) {
@@ -1653,6 +2115,8 @@ async function extractPostDetails(detailPage, post, searchTerm) {
         state: cityState.state,
         lead_type: ["general_contracting"],
         search_term: searchTerm,
+        posted_at_text: post.posted_at_text || null,
+        posted_at: parseNextdoorPostTimestamp(post.posted_at_text),
     };
 }
 
@@ -1669,7 +2133,10 @@ async function insertUnfilteredGeneralContracting(record) {
             lead_type,
             timestamp
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7::text[], NOW())
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7::text[],
+            COALESCE($8::timestamp, NOW())
+        )
             ON CONFLICT (post_url) DO UPDATE SET
             author = COALESCE(
                                           EXCLUDED.author,
@@ -1719,6 +2186,7 @@ async function insertUnfilteredGeneralContracting(record) {
         Array.isArray(record.lead_type)
             ? record.lead_type
             : [record.lead_type],
+        record.posted_at || null,
     ]);
 
     const insertedId = rows[0]?.id || null;
@@ -2393,7 +2861,7 @@ function printTermHistory(query, performanceByTerm) {
     );
 }
 
-async function collectPostsForSearchTerm(context, query) {
+async function collectPostsForSearchTerm(context, query, termSource) {
     let lastError = null;
 
     for (
@@ -2416,7 +2884,14 @@ async function collectPostsForSearchTerm(context, query) {
                 `search:${query}:attempt:${attempt}`,
             );
 
-            await searchNextdoor(searchPage, query);
+            const targetDateLabel =
+                getDateFilterForTermSource(termSource);
+
+            await searchNextdoor(
+                searchPage,
+                query,
+                targetDateLabel,
+            );
 
             const posts = await collectPostLinks(
                 searchPage,
@@ -2444,6 +2919,10 @@ async function collectPostsForSearchTerm(context, query) {
                     `BROWSER_DISCONNECTED while searching for "${query}": ` +
                     getErrorMessage(error),
                 );
+            }
+
+            if (isNextdoorThrottleError(error)) {
+                throw error;
             }
 
             console.error(
@@ -2577,6 +3056,7 @@ async function processSearchTerm({
     const allPosts = await collectPostsForSearchTerm(
         context,
         query,
+        termSource,
     );
 
     const existingAll = await getExistingUrls(allPosts);
@@ -2586,12 +3066,11 @@ async function processSearchTerm({
     for (const post of allPosts) {
         const url = normalizePostUrl(post.url);
 
-        if (seenDuringRun.has(url)) {
+        if (isCrossTermDuplicate(seenDuringRun, post)) {
             crossTermUrls.add(url);
             continue;
         }
 
-        seenDuringRun.add(url);
         uniqueForThisRun.push(post);
     }
 
@@ -2909,21 +3388,55 @@ async function main() {
         await purgeExpiredSearchHistory();
 
         const strategy = await buildAdaptiveSearchPlan();
-        const randomizedPlan = shuffleArray(strategy.plan);
 
-        console.log(
-            `🔀 Randomized ${randomizedPlan.length} GC search terms for this run.`,
+        const carryoverTerms =
+            await fetchCarryoverSearchTerms();
+
+        const carryoverKeys = new Set(
+            carryoverTerms.map((entry) =>
+                normalizeSearchTerm(entry.query),
+            ),
         );
 
-
-        console.log(
-            "🔀 Search order this run:",
-            randomizedPlan.map((entry) => entry.query),
+        const normalTerms = strategy.plan.filter(
+            (entry) =>
+                !carryoverKeys.has(
+                    normalizeSearchTerm(entry.query),
+                ),
         );
 
-        await createSearchRun(runId, strategy);
+        const randomizedCarryover =
+            shuffleArray(carryoverTerms);
+
+        const randomizedNormal =
+            shuffleArray(normalTerms);
+
+        const executionPlan = [
+            ...randomizedCarryover,
+            ...randomizedNormal,
+        ];
+
+        const runStrategy = {
+            ...strategy,
+            plan: executionPlan,
+        };
+
+        await createSearchRun(runId, runStrategy);
 
         console.log(`🆔 GC search run: ${runId}`);
+        console.log(
+            `♻️ Carryover terms prioritized: ${randomizedCarryover.length}`,
+        );
+        console.log(
+            `🔀 Normal adaptive terms randomized after carryover: ${randomizedNormal.length}`,
+        );
+        console.log(
+            `📋 Final general contractor execution plan: ${executionPlan.length} term(s).`,
+        );
+        console.log(
+            "🔀 Search order this run:",
+            executionPlan.map((entry) => entry.query),
+        );
 
         browser = await chromium.connectOverCDP(
             process.env.MULTILOGIN_WS,
@@ -2955,16 +3468,18 @@ async function main() {
         await closeStaleContextPages(context, bootstrapPage);
         await parkBootstrapPage(bootstrapPage);
 
-        const seenDuringRun = new Set();
+        const seenDuringRun = new Map();
 
         for (
             let termIndex = 0;
-            termIndex < randomizedPlan.length;
+            termIndex < executionPlan.length;
             termIndex += 1
         ) {
-            const entry = randomizedPlan[termIndex];
+            const entry = executionPlan[termIndex];
             const query = entry.query;
             const termSource = entry.source;
+
+            let lastTermResult = null;
 
             if (
                 browserDisconnected ||
@@ -2978,7 +3493,7 @@ async function main() {
             console.log("");
             console.log("############################################################");
             console.log(
-                `🔎 SEARCH ${termIndex + 1}/${randomizedPlan.length}: ` +
+                `🔎 SEARCH ${termIndex + 1}/${executionPlan.length}: ` +
                 `"${query}" [${termSource}]`,
             );
             printTermHistory(query, strategy.performanceByTerm);
@@ -2992,6 +3507,8 @@ async function main() {
                     runId,
                     seenDuringRun,
                 });
+
+                lastTermResult = result;
 
                 totals.inserted += result.inserted;
                 totals.failed += result.failed;
@@ -3011,6 +3528,36 @@ async function main() {
                     throw error;
                 }
 
+                if (isNextdoorThrottleError(error)) {
+                    const message = getErrorMessage(error);
+                    const parts = message.split(":");
+                    const waitSeconds = Number(parts[1] || 0);
+                    const remainingTerms =
+                        executionPlan.slice(termIndex);
+
+                    console.error(
+                        "⛔ Nextdoor throttle detected. " +
+                        "Saving the unfinished general contractor terms " +
+                        "before stopping this run.",
+                    );
+
+                    if (waitSeconds > 0) {
+                        console.error(
+                            `⏳ Nextdoor requested a cooldown of approximately ` +
+                            `${waitSeconds} seconds.`,
+                        );
+                    }
+
+                    await saveThrottleCarryover({
+                        runId,
+                        throttledTerm: query,
+                        waitSeconds,
+                        remainingTerms,
+                    });
+
+                    throw error;
+                }
+
                 console.error(
                     `⏭️ Skipping search term "${query}" after ` +
                     `fresh-page retries: ${getErrorMessage(error)}`,
@@ -3019,7 +3566,16 @@ async function main() {
             }
 
             totals.uniqueResultUrls = seenDuringRun.size;
-            await sleep(1_000);
+
+            const interTermDelayMs =
+                getAdaptiveTermDelayMs(lastTermResult || {});
+
+            console.log(
+                `🕒 Pacing before next term: ${Math.round(interTermDelayMs / 1000)}s ` +
+                `(${lastTermResult?.newCandidates || 0} new detail candidate(s)).`,
+            );
+
+            await sleep(interTermDelayMs);
         }
 
         console.log("");
@@ -3028,6 +3584,7 @@ async function main() {
         );
         console.log("✅ Adaptive general contracting scrape finished.");
         console.log(`   Run ID: ${runId}`);
+        console.log(`   Search terms: ${executionPlan.length}`);
         console.log(
             `   Result observations logged: ${totals.resultObservations}`,
         );
@@ -3054,6 +3611,8 @@ async function main() {
         await finishSearchRun(runId, "completed", totals);
         searchRunFinalized = true;
 
+        await clearCarryoverSearchTerms(runId);
+
         // The FTN pipeline is unchanged: the scraper still asks the internal
         // FTN service to run pre_enrichment first, then FamilyTreeNow.
         await triggerFtnEnrichment({
@@ -3071,7 +3630,9 @@ async function main() {
         if (!searchRunFinalized) {
             await finishSearchRun(
                 runId,
-                "failed",
+                isNextdoorThrottleError(error)
+                    ? "throttled"
+                    : "failed",
                 totals,
                 getErrorMessage(error),
             ).catch((finishError) => {
