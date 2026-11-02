@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 
-//redploy test
 "use strict";
 
 require("dotenv").config();
 
-const crypto = require("crypto");
+const { randomUUID } = require("crypto");
 const { chromium } = require("playwright-core");
 const pool = require("./db/db");
 const normalizeCity = require("./normalizeCity");
 
-const TABLE_NAME = "unfiltered_general_contracting";
+const TABLE_NAME =
+    "unfiltered_general_contracting";
 
-const SEARCH_RUNS_TABLE = "gc_search_runs";
-const SEARCH_RESULTS_TABLE = "gc_search_results";
+// Search-learning audit tables. These do not change which fixed search terms run;
+// they only record result quality so terms/categories can be ranked over time.
+const SEARCH_RUNS_TABLE = "gc_combined_search_runs";
+const SEARCH_RESULTS_TABLE = "gc_combined_search_results";
+const SEARCH_TERM_SOURCE = "fixed";
 
 const ENRICHMENT_ENDPOINT_PATH = "/run";
 
@@ -32,7 +35,9 @@ const NEXTDOOR_QUEUE_SCRAPER_NAME =
     "McKinney Dallas General Contractor Scraper";
 
 const MAX_POSTS_PER_TERM = Number(
-    process.env.GENERAL_CONTRACTING_MAX_POSTS || 50,
+    process.env.GENERAL_CONTRACTING_MAX_POSTS ||
+    process.env.GENERAL_CONTRACTING_MAX_POSTS ||
+    50,
 );
 
 const TERM_DELAY_MIN_MS = Math.max(
@@ -54,52 +59,19 @@ const DETAIL_WEIGHT_DELAY_CAP_MS = Math.max(
     0,
     Number(process.env.GC_DETAIL_WEIGHT_DELAY_CAP_MS || 12_000),
 );
-
 const FALLBACK_STATE =
-    process.env.GENERAL_CONTRACTING_FALLBACK_STATE || "TX";
+    process.env.GENERAL_CONTRACTING_FALLBACK_STATE ||
+    process.env.GENERAL_CONTRACTING_FALLBACK_STATE ||
+    "TX";
 
-const SEARCH_HISTORY_DAYS = Math.max(
-    7,
-    Number(process.env.GC_SEARCH_HISTORY_DAYS || 30),
-);
-
-const SONAR_COOLDOWN_DAYS = Math.max(
-    1,
-    Number(process.env.GC_SONAR_COOLDOWN_DAYS || 5),
-);
-
-const WINNER_TERM_COUNT = Math.max(
-    0,
-    Number(process.env.GC_WINNER_TERM_COUNT || 4),
-);
-
-const SONAR_TERM_COUNT = Math.max(
-    0,
-    Number(process.env.GC_SONAR_TERM_COUNT || 6),
-);
-
-const PPLX_API_KEY =
-    process.env.PPLX_API_KEY ||
-    process.env.PERPLEXITY_API_KEY ||
-    "";
-
-const PPLX_API_URL =
-    process.env.PPLX_API_URL ||
-    "https://api.perplexity.ai/chat/completions";
-
-const PPLX_MODEL =
-    process.env.PPLX_MODEL ||
-    "sonar";
-
-const DEFAULT_ANCHOR_TERMS = [
+// Preserve the existing general contractor anchor/exploration vocabulary,
+// but run it through the combined scraper's proven fixed-term workflow.
+const DEFAULT_GENERAL_CONTRACTOR_TERMS = [
     "general contractor",
     "contractor recommendation",
     "remodeling contractor",
     "foundation repair",
     "home remodel",
-];
-
-const DEFAULT_EXPLORATION_TERMS = [
     "foundation contractor",
     "structural repair",
     "concrete contractor",
@@ -129,24 +101,22 @@ const DEFAULT_EXPLORATION_TERMS = [
     "custom carpentry",
     "water damage repair",
     "storm damage contractor",
-    "fire damage repair",
+    "fire damage repair"
 ];
 
-function parseConfiguredTerms(value, fallback) {
-    if (!value) return [...fallback];
-
-    const terms = String(value)
-        .split(/[\n,|]/)
-        .map((term) => cleanText(term))
-        .filter(Boolean);
-
-    return terms.length ? terms : [...fallback];
-}
-
-const ANCHOR_TERMS = parseConfiguredTerms(
-    process.env.GC_ANCHOR_TERMS,
-    DEFAULT_ANCHOR_TERMS,
+const SEARCH_TERMS = [...new Set(DEFAULT_GENERAL_CONTRACTOR_TERMS)];
+const SEARCH_TERM_LEAD_TYPES = Object.fromEntries(
+    SEARCH_TERMS.map(term => [term, ["general_contractor"]])
 );
+const getLeadTypesForSearchTerm = () => ["general_contractor"];
+const getSearchDistance = () => 15;
+const getSearchFilterConfig = () => ({
+    miles: 15,
+    dateLabel: "Today",
+    dateParam: "TODAY",
+});
+const LEAD_TYPES = ["general_contractor"];
+console.log(`🔎 General contracting scraper configured with ${SEARCH_TERMS.length} search terms`);
 
 const SEARCH_PAGE_MAX_ATTEMPTS = Math.max(
     1,
@@ -203,235 +173,6 @@ function getErrorMessage(error) {
     return error?.message || String(error || "Unknown error");
 }
 
-function shuffleArray(items) {
-    const shuffled = [...items];
-
-    for (let index = shuffled.length - 1; index > 0; index -= 1) {
-        const swapIndex = Math.floor(Math.random() * (index + 1));
-        [shuffled[index], shuffled[swapIndex]] = [
-            shuffled[swapIndex],
-            shuffled[index],
-        ];
-    }
-
-    return shuffled;
-}
-
-function getAdaptiveTermDelayMs(result = {}) {
-    const baseRange = Math.max(
-        0,
-        TERM_DELAY_MAX_MS - TERM_DELAY_MIN_MS,
-    );
-
-    const base =
-        TERM_DELAY_MIN_MS +
-        Math.floor(Math.random() * (baseRange + 1));
-
-    const detailLoad = Math.min(
-        DETAIL_WEIGHT_DELAY_CAP_MS,
-        Math.max(0, Number(result.newCandidates || 0)) *
-            DETAIL_WEIGHT_DELAY_MS,
-    );
-
-    return base + detailLoad;
-}
-
-function parseNextdoorThrottleMessage(text = "") {
-    const match = String(text).match(
-        /Throttled,\s*wait\s*(\d+)\s*seconds\.?/i,
-    );
-
-    if (!match) return null;
-
-    return {
-        waitSeconds: Number(match[1]),
-        message: match[0],
-    };
-}
-
-function isNextdoorThrottleError(error) {
-    return /^NEXTDOOR_THROTTLED:/i.test(getErrorMessage(error));
-}
-
-async function detectNextdoorThrottle(page) {
-    const bodyText = await page
-        .locator("body")
-        .innerText()
-        .catch(() => "");
-
-    return parseNextdoorThrottleMessage(bodyText);
-}
-
-function nextdoorQueueEndpoint(pathname) {
-    return NEXTDOOR_QUEUE_API_BASE_URL.replace(/\/$/, "") + pathname;
-}
-
-async function fetchCarryoverSearchTerms() {
-    if (!NEXTDOOR_QUEUE_API_BASE_URL) {
-        console.log("ℹ️ Nextdoor queue API is not configured; continuing without carryover terms.");
-        return [];
-    }
-
-    const endpointUrl = nextdoorQueueEndpoint(
-        `/search-queue/${encodeURIComponent(NEXTDOOR_QUEUE_SCRAPER_KEY)}`,
-    );
-
-    try {
-        console.log(`♻️ Loading unfinished Nextdoor search terms → ${endpointUrl}`);
-
-        const response = await fetch(endpointUrl, {
-            method: "GET",
-            headers: { Accept: "application/json" },
-            signal: AbortSignal.timeout(
-                Math.max(
-                    5000,
-                    Number(process.env.NEXTDOOR_QUEUE_TIMEOUT_MS || 20000),
-                ),
-            ),
-        });
-
-        const responseText = await response.text();
-
-        if (!response.ok) {
-            throw new Error(
-                `Queue GET returned HTTP ${response.status}: ` +
-                responseText.slice(0, 500),
-            );
-        }
-
-        const body = responseText ? JSON.parse(responseText) : {};
-        const rawTerms = Array.isArray(body?.pending_terms)
-            ? body.pending_terms
-            : [];
-
-        const entries = [];
-        const seen = new Set();
-
-        for (const entry of rawTerms) {
-            const query = cleanText(
-                typeof entry === "string"
-                    ? entry
-                    : entry?.query || entry?.search_term || "",
-            );
-            const key = normalizeSearchTerm(query);
-
-            if (!query || !key || seen.has(key)) continue;
-
-            seen.add(key);
-            entries.push({
-                query,
-                source:
-                    typeof entry === "object" && entry?.source
-                        ? cleanText(entry.source)
-                        : "carryover",
-            });
-        }
-
-        console.log(`♻️ Loaded ${entries.length} unfinished general contractor term(s).`);
-        return entries;
-    } catch (error) {
-        console.warn(
-            "⚠️ Could not load general contractor carryover queue; continuing with the normal adaptive plan: " +
-            getErrorMessage(error),
-        );
-        return [];
-    }
-}
-
-async function saveThrottleCarryover({
-    runId,
-    throttledTerm,
-    waitSeconds,
-    remainingTerms,
-}) {
-    if (!NEXTDOOR_QUEUE_API_BASE_URL) return false;
-
-    const endpointUrl = nextdoorQueueEndpoint("/search-queue/throttled");
-
-    try {
-        const response = await fetch(endpointUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                scraper_key: NEXTDOOR_QUEUE_SCRAPER_KEY,
-                scraper_name: NEXTDOOR_QUEUE_SCRAPER_NAME,
-                run_id: runId,
-                throttled_term: throttledTerm,
-                wait_seconds: waitSeconds || null,
-                remaining_terms: remainingTerms.map((entry) => ({
-                    query: entry.query,
-                    source: entry.source || "unknown",
-                })),
-            }),
-            signal: AbortSignal.timeout(
-                Math.max(
-                    5000,
-                    Number(process.env.NEXTDOOR_QUEUE_TIMEOUT_MS || 20000),
-                ),
-            ),
-        });
-
-        const responseText = await response.text();
-        if (!response.ok) {
-            throw new Error(
-                `Queue POST returned HTTP ${response.status}: ` +
-                responseText.slice(0, 500),
-            );
-        }
-
-        console.log(
-            `♻️ Saved ${remainingTerms.length} unfinished general contractor term(s) to the backend carryover queue.`,
-        );
-        return true;
-    } catch (error) {
-        console.error(
-            "⚠️ Could not save general contractor carryover queue before exit: " +
-            getErrorMessage(error),
-        );
-        return false;
-    }
-}
-
-async function clearCarryoverSearchTerms(runId) {
-    if (!NEXTDOOR_QUEUE_API_BASE_URL) return false;
-
-    const endpointUrl = nextdoorQueueEndpoint("/search-queue/completed");
-
-    try {
-        const response = await fetch(endpointUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                scraper_key: NEXTDOOR_QUEUE_SCRAPER_KEY,
-                run_id: runId,
-            }),
-            signal: AbortSignal.timeout(
-                Math.max(
-                    5000,
-                    Number(process.env.NEXTDOOR_QUEUE_TIMEOUT_MS || 20000),
-                ),
-            ),
-        });
-
-        const responseText = await response.text();
-        if (!response.ok) {
-            throw new Error(
-                `Queue completion POST returned HTTP ${response.status}: ` +
-                responseText.slice(0, 500),
-            );
-        }
-
-        console.log("✅ Cleared general contractor carryover queue after full search completion.");
-        return true;
-    } catch (error) {
-        console.warn(
-            "⚠️ Could not clear general contractor carryover queue: " +
-            getErrorMessage(error),
-        );
-        return false;
-    }
-}
-
 function isTargetCrashError(error) {
     return TARGET_CRASH_PATTERN.test(getErrorMessage(error));
 }
@@ -450,6 +191,333 @@ function isRetryablePageError(error) {
         /target page, context or browser has been closed/i.test(message) ||
         /navigation failed|net::err_|timeout/i.test(message)
     );
+}
+
+function shuffleArray(items) {
+    const shuffled = [...items];
+
+    for (let i = shuffled.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+
+        [shuffled[i], shuffled[j]] = [
+            shuffled[j],
+            shuffled[i],
+        ];
+    }
+
+    return shuffled;
+}
+
+function parseNextdoorThrottleMessage(text = "") {
+    const match = String(text).match(
+        /Throttled,\s*wait\s*(\d+)\s*seconds\.?/i,
+    );
+
+    if (!match) return null;
+
+    return {
+        waitSeconds: Number(match[1]),
+        message: match[0],
+    };
+}
+
+function isNextdoorThrottleError(error) {
+    return /^NEXTDOOR_THROTTLED:/i.test(
+        getErrorMessage(error),
+    );
+}
+
+async function detectNextdoorThrottle(page) {
+    const bodyText = await page
+        .locator("body")
+        .innerText()
+        .catch(() => "");
+
+    return parseNextdoorThrottleMessage(bodyText);
+}
+function nextdoorQueueEndpoint(pathname) {
+    return (
+        NEXTDOOR_QUEUE_API_BASE_URL.replace(/\/$/, "") +
+        pathname
+    );
+}
+
+
+async function fetchCarryoverSearchTerms() {
+    if (!NEXTDOOR_QUEUE_API_BASE_URL) {
+        console.log(
+            "ℹ️ Nextdoor queue API is not configured; " +
+            "continuing without carryover terms.",
+        );
+
+        return [];
+    }
+
+    const endpointUrl =
+        nextdoorQueueEndpoint(
+            `/search-queue/${encodeURIComponent(
+                NEXTDOOR_QUEUE_SCRAPER_KEY,
+            )}`,
+        );
+
+    try {
+        console.log(
+            `♻️ Loading unfinished combined search terms → ` +
+            `${endpointUrl}`,
+        );
+
+        const response = await fetch(
+            endpointUrl,
+            {
+                method: "GET",
+
+                headers: {
+                    Accept: "application/json",
+                },
+
+                signal: AbortSignal.timeout(
+                    Math.max(
+                        5_000,
+                        Number(
+                            process.env
+                                .NEXTDOOR_QUEUE_TIMEOUT_MS ||
+                            20_000,
+                        ),
+                    ),
+                ),
+            },
+        );
+
+        const responseText =
+            await response.text();
+
+        if (!response.ok) {
+            throw new Error(
+                `Queue GET returned HTTP ` +
+                `${response.status}: ` +
+                responseText.slice(0, 500),
+            );
+        }
+
+        const body =
+            responseText
+                ? JSON.parse(responseText)
+                : {};
+
+        const rawTerms =
+            Array.isArray(body?.pending_terms)
+                ? body.pending_terms
+                : [];
+
+        const terms = [];
+        const seen = new Set();
+
+        for (const entry of rawTerms) {
+            const query = cleanText(
+                typeof entry === "string"
+                    ? entry
+                    : entry?.query ||
+                    entry?.search_term ||
+                    "",
+            );
+
+            const key =
+                query.toLowerCase();
+
+            if (
+                !query ||
+                seen.has(key)
+            ) {
+                continue;
+            }
+
+            seen.add(key);
+            terms.push(query);
+        }
+
+        console.log(
+            `♻️ Loaded ${terms.length} unfinished ` +
+            `combined search term(s).`,
+        );
+
+        return terms;
+
+    } catch (error) {
+        console.warn(
+            "⚠️ Could not load combined carryover queue; " +
+            "continuing with the normal randomized plan: " +
+            getErrorMessage(error),
+        );
+
+        return [];
+    }
+}
+
+
+async function saveThrottleCarryover({
+                                         runId,
+                                         throttledTerm,
+                                         waitSeconds,
+                                         remainingTerms,
+                                     }) {
+    if (!NEXTDOOR_QUEUE_API_BASE_URL) {
+        return false;
+    }
+
+    const endpointUrl =
+        nextdoorQueueEndpoint(
+            "/search-queue/throttled",
+        );
+
+    try {
+        const response = await fetch(
+            endpointUrl,
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json",
+                },
+
+                body: JSON.stringify({
+                    scraper_key:
+                    NEXTDOOR_QUEUE_SCRAPER_KEY,
+
+                    scraper_name:
+                    NEXTDOOR_QUEUE_SCRAPER_NAME,
+
+                    run_id:
+                    runId,
+
+                    throttled_term:
+                    throttledTerm,
+
+                    wait_seconds:
+                        waitSeconds || null,
+
+                    remaining_terms:
+                        remainingTerms.map(
+                            (query) => ({
+                                query,
+                                source: "fixed",
+                            }),
+                        ),
+                }),
+
+                signal: AbortSignal.timeout(
+                    Math.max(
+                        5_000,
+                        Number(
+                            process.env
+                                .NEXTDOOR_QUEUE_TIMEOUT_MS ||
+                            20_000,
+                        ),
+                    ),
+                ),
+            },
+        );
+
+        const responseText =
+            await response.text();
+
+        if (!response.ok) {
+            throw new Error(
+                `Queue POST returned HTTP ` +
+                `${response.status}: ` +
+                responseText.slice(0, 500),
+            );
+        }
+
+        console.log(
+            `♻️ Saved ${remainingTerms.length} unfinished ` +
+            `combined term(s) to the backend queue.`,
+        );
+
+        return true;
+
+    } catch (error) {
+        console.error(
+            "⚠️ Could not save combined carryover queue " +
+            "before exit: " +
+            getErrorMessage(error),
+        );
+
+        return false;
+    }
+}
+
+
+async function clearCarryoverSearchTerms(
+    runId,
+) {
+    if (!NEXTDOOR_QUEUE_API_BASE_URL) {
+        return false;
+    }
+
+    const endpointUrl =
+        nextdoorQueueEndpoint(
+            "/search-queue/completed",
+        );
+
+    try {
+        const response = await fetch(
+            endpointUrl,
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json",
+                },
+
+                body: JSON.stringify({
+                    scraper_key:
+                    NEXTDOOR_QUEUE_SCRAPER_KEY,
+
+                    run_id:
+                    runId,
+                }),
+
+                signal: AbortSignal.timeout(
+                    Math.max(
+                        5_000,
+                        Number(
+                            process.env
+                                .NEXTDOOR_QUEUE_TIMEOUT_MS ||
+                            20_000,
+                        ),
+                    ),
+                ),
+            },
+        );
+
+        const responseText =
+            await response.text();
+
+        if (!response.ok) {
+            throw new Error(
+                `Queue completion POST returned HTTP ` +
+                `${response.status}: ` +
+                responseText.slice(0, 500),
+            );
+        }
+
+        console.log(
+            "✅ Cleared combined carryover queue " +
+            "after full search completion.",
+        );
+
+        return true;
+
+    } catch (error) {
+        console.warn(
+            "⚠️ Could not clear combined carryover queue: " +
+            getErrorMessage(error),
+        );
+
+        return false;
+    }
 }
 
 async function configurePage(page, label) {
@@ -490,20 +558,22 @@ async function configurePage(page, label) {
             );
         }
     });
-
     page.on("response", (response) => {
-        if (response.status() !== 429) return;
+        if (response.status() !== 429) {
+            return;
+        }
 
         const responseUrl = response.url();
 
         if (/nextdoor\\.com\\/search/i.test(responseUrl)) {
             page.__nextdoorSearchRateLimited = true;
         }
-        if (/nextdoor\.com/i.test(responseUrl)) {
-            console.error(`🌐 HTTP 429 (${label}): ${responseUrl}`);
+        if (/nextdoor\.com\/search/i.test(responseUrl)) {
+            console.error(
+                `🌐 HTTP 429 (${label}): ${responseUrl}`,
+            );
         }
     });
-
     await page.route("**/*", async (route) => {
         const request = route.request();
         const resourceType = request.resourceType();
@@ -637,7 +707,9 @@ function parseNextdoorPostTimestamp(value, now = new Date()) {
     const lower = raw.toLowerCase();
     const date = new Date(now);
 
-    if (/^today$/i.test(raw)) return date.toISOString();
+    if (/^today$/i.test(raw)) {
+        return date.toISOString();
+    }
 
     if (/^yesterday$/i.test(raw)) {
         date.setDate(date.getDate() - 1);
@@ -667,19 +739,136 @@ function parseNextdoorPostTimestamp(value, now = new Date()) {
         const day = Number(match[1]);
         const monthName = match[2];
         let year = match[3] ? Number(match[3]) : now.getFullYear();
-        let parsed = new Date(monthName + " " + day + ", " + year + " 12:00:00");
+        let parsed = new Date(
+            monthName + " " + day + ", " + year + " 12:00:00"
+        );
 
-        if (Number.isNaN(parsed.getTime())) return null;
+        if (Number.isNaN(parsed.getTime())) {
+            return null;
+        }
 
         if (!match[3] && parsed.getTime() > now.getTime() + 7 * 86400000) {
             year -= 1;
-            parsed = new Date(monthName + " " + day + ", " + year + " 12:00:00");
+            parsed = new Date(
+                monthName + " " + day + ", " + year + " 12:00:00"
+            );
         }
 
-        return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+        return Number.isNaN(parsed.getTime())
+            ? null
+            : parsed.toISOString();
     }
 
     return null;
+}
+
+function normalizeDuplicateText(value) {
+    return cleanText(value || "")
+        .toLowerCase()
+        .replace(/[“”"‘’']/g, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function descriptionsLookLikeSamePost(left, right) {
+    const a = normalizeDuplicateText(left);
+    const b = normalizeDuplicateText(right);
+
+    if (!a || !b) return false;
+    if (a === b) return true;
+
+    const shorter = a.length <= b.length ? a : b;
+    const longer = a.length <= b.length ? b : a;
+
+    if (shorter.length >= 30 && longer.includes(shorter)) {
+        return true;
+    }
+
+    const tokensA = new Set(
+        a.split(" ").filter((token) => token.length >= 3),
+    );
+    const tokensB = new Set(
+        b.split(" ").filter((token) => token.length >= 3),
+    );
+
+    if (!tokensA.size || !tokensB.size) {
+        return false;
+    }
+
+    let overlap = 0;
+
+    for (const token of tokensA) {
+        if (tokensB.has(token)) overlap += 1;
+    }
+
+    const smallerTokenCount = Math.min(tokensA.size, tokensB.size);
+
+    return (
+        smallerTokenCount >= 5 &&
+        overlap / smallerTokenCount >= 0.82
+    );
+}
+
+function authorsCompatibleForDuplicate(left, right) {
+    const a = normalizeDuplicateText(left);
+    const b = normalizeDuplicateText(right);
+
+    if (!a || !b) {
+        return true;
+    }
+
+    return a === b;
+}
+
+function isCrossTermDuplicate(seenDuringRun, item) {
+    const url = normalizePostUrl(item.url || item.post_url);
+    const description =
+        item.preview || item.text || item.description || "";
+
+    const priorItems = seenDuringRun.get(url) || [];
+
+    const duplicate = priorItems.some((prior) =>
+        authorsCompatibleForDuplicate(prior.author, item.author) &&
+        descriptionsLookLikeSamePost(prior.description, description)
+    );
+
+    if (duplicate) {
+        return true;
+    }
+
+    if (priorItems.length > 0) {
+        console.warn(
+            `⚠️ Same-run reused/mismatched URL not treated as cross-term duplicate: ${url}`,
+        );
+    }
+
+    priorItems.push({
+        author: item.author || null,
+        description,
+    });
+
+    seenDuringRun.set(url, priorItems);
+    return false;
+}
+
+function getAdaptiveTermDelayMs(result = {}) {
+    const baseRange = Math.max(
+        0,
+        TERM_DELAY_MAX_MS - TERM_DELAY_MIN_MS,
+    );
+
+    const base =
+        TERM_DELAY_MIN_MS +
+        Math.floor(Math.random() * (baseRange + 1));
+
+    const detailLoad = Math.min(
+        DETAIL_WEIGHT_DELAY_CAP_MS,
+        Math.max(0, Number(result.newCandidates || 0)) *
+            DETAIL_WEIGHT_DELAY_MS,
+    );
+
+    return base + detailLoad;
 }
 
 function normalizePostUrl(url) {
@@ -735,26 +924,11 @@ function guessCity(location = "") {
         "north richland hills",
         "lowry crossing",
         "melissa",
-
-        // Arlington / Grand Prairie / Mid-Cities area
-        "grand prairie",
-        "pantego",
-        "dalworthington gardens",
-        "euless",
-        "bedford",
-        "hurst",
-        "irving",
-        "richland hills",
-        "colleyville",
-        "haltom city",
-        "kennedale",
-        "mansfield",
     ];
 
     const direct = knownCities.find((city) => lower.includes(city));
 
     if (direct) return direct;
-
     if (lower.includes("craig ranch")) return "mckinney";
     if (lower.includes("eldorado")) return "mckinney";
     if (lower.includes("trinity falls")) return "mckinney";
@@ -1223,22 +1397,13 @@ async function applyDistanceFilter(page, targetMiles = 15) {
     return false;
 }
 
-function getDateFilterForTermSource(termSource) {
-    return ["sonar", "fallback", "carryover"].includes(termSource)
-        ? "This Week"
-        : "Today";
-}
 
-function getDateFilterParam(targetLabel) {
-    return targetLabel === "This Week" ? "THIS_WEEK" : "TODAY";
-}
-
-async function applyDateFilter(page, targetLabel) {
+async function applyDateFilter(page, targetLabel = "Today") {
     console.log(`🗓️ Applying "${targetLabel}" date filter...`);
 
     const anyDateLabel =
         /^(All Time|Today|This Week|This Month|This Year)$/i;
-    const exactTarget = targetLabel === "This Week"
+    const targetRegex = targetLabel === "This Week"
         ? /^This Week$/i
         : /^Today$/i;
 
@@ -1263,19 +1428,23 @@ async function applyDateFilter(page, targetLabel) {
     }
 
     if (!trigger) {
-        throw new Error("DATE_FILTER_NOT_FOUND:" + targetLabel);
+        throw new Error(
+            `DATE_FILTER_NOT_FOUND: ${targetLabel}`,
+        );
     }
 
-    const before = cleanText(await trigger.innerText().catch(() => ""));
+    const before = cleanText(
+        await trigger.innerText().catch(() => "")
+    );
 
-    if (!exactTarget.test(before)) {
+    if (!targetRegex.test(before)) {
         await trigger.click();
         await sleep(500);
 
         const optionCandidates = [
-            page.getByRole("menuitem", { name: exactTarget }).first(),
-            page.getByRole("option", { name: exactTarget }).first(),
-            page.getByText(exactTarget).last(),
+            page.getByRole("menuitem", { name: targetRegex }).first(),
+            page.getByRole("option", { name: targetRegex }).first(),
+            page.getByText(targetRegex).last(),
         ];
 
         let clicked = false;
@@ -1292,7 +1461,9 @@ async function applyDateFilter(page, targetLabel) {
         }
 
         if (!clicked) {
-            throw new Error("DATE_FILTER_OPTION_NOT_FOUND:" + targetLabel);
+            throw new Error(
+                `DATE_FILTER_OPTION_NOT_FOUND: ${targetLabel}`,
+            );
         }
 
         await sleep(1_200);
@@ -1304,21 +1475,31 @@ async function applyDateFilter(page, targetLabel) {
         .first();
 
     const after = cleanText(
-        await verifyTrigger.innerText().catch(() => ""),
+        await verifyTrigger.innerText().catch(() => "")
     );
 
-    if (!exactTarget.test(after)) {
+    if (!targetRegex.test(after)) {
         throw new Error(
-            "DATE_FILTER_NOT_APPLIED: expected " + targetLabel +
-            ", saw \"" + (after || "unknown") + "\"",
+            `DATE_FILTER_NOT_APPLIED: expected ${targetLabel}, saw "${after || "unknown"}"`,
         );
     }
 
-    console.log(`✅ Visible Nextdoor date filter verified: ${targetLabel}`);
+    console.log(
+        `✅ Visible Nextdoor date filter verified: ${targetLabel}`,
+    );
+
     return true;
 }
-async function applySearchFiltersByUrl(page, query, targetDateLabel) {
+
+async function applySearchFiltersByUrl(page, query) {
     const currentUrl = new URL(page.url());
+
+    const {
+        miles: targetMiles,
+        dateParam,
+        dateLabel
+    } = getSearchFilterConfig(query);
+
 
     if (!/(^|\.)nextdoor\.com$/i.test(currentUrl.hostname)) {
         throw new Error(
@@ -1337,21 +1518,21 @@ async function applySearchFiltersByUrl(page, query, targetDateLabel) {
         "postSortOrder",
         "SORT_BY_RECENCY",
     );
-    currentUrl.searchParams.set("postDistance", "15");
+    currentUrl.searchParams.set(
+        "postDistance",
+        String(targetMiles),
+    );
     currentUrl.searchParams.set(
         "postDistanceUnit",
         "MILES",
     );
-    currentUrl.searchParams.set(
-        "postDateFilter",
-        getDateFilterParam(targetDateLabel),
-    );
+    currentUrl.searchParams.set("postDateFilter", dateParam);
 
     const targetUrl = currentUrl.toString();
 
     console.log("🔗 Applying search filters through the URL:");
     console.log(
-        `   Posts + Most Recent + 15 miles + ${targetDateLabel}`,
+        `   Posts + Most Recent + ${targetMiles} miles + ${dateLabel}`
     );
     console.log(`   ${targetUrl}`);
 
@@ -1384,9 +1565,9 @@ async function applySearchFiltersByUrl(page, query, targetDateLabel) {
         applied.navigationScreen === "POST" &&
         applied.query === query &&
         applied.postSortOrder === "SORT_BY_RECENCY" &&
-        applied.postDistance === "15" &&
+        applied.postDistance === String(targetMiles) &&
         applied.postDistanceUnit === "MILES" &&
-        applied.postDateFilter === getDateFilterParam(targetDateLabel);
+        applied.postDateFilter === dateParam
 
     if (!filtersAreCorrect) {
         throw new Error(
@@ -1395,7 +1576,7 @@ async function applySearchFiltersByUrl(page, query, targetDateLabel) {
     }
 }
 
-async function searchNextdoor(page, query, targetDateLabel) {
+async function searchNextdoor(page, query) {
     console.log("");
     console.log("============================================================");
     console.log(`🔍 Searching Nextdoor for "${query}"...`);
@@ -1424,6 +1605,7 @@ async function searchNextdoor(page, query, targetDateLabel) {
         }
     }
 
+
     if (!searchBox) {
         throw new Error(
             "Could not find the Nextdoor search bar after waiting for the feed.",
@@ -1436,14 +1618,25 @@ async function searchNextdoor(page, query, targetDateLabel) {
     await page.waitForLoadState("domcontentloaded").catch(() => {});
     await sleep(3_000);
 
-    // URL state alone is not trusted. We still navigate with the requested
-    // parameters, then physically click and verify the visible controls.
+    // Get the correct filters for this search term.
+    const filterConfig = getSearchFilterConfig(query);
+
+    console.log(
+        `🎯 Search configuration for "${query}": ` +
+        `${filterConfig.miles} miles + ${filterConfig.dateLabel}`
+    );
+
+    // Use URL parameters for navigation, but do not trust them as proof
+    // that Nextdoor actually applied the requested result window.
     try {
-        await applySearchFiltersByUrl(page, query, targetDateLabel);
+        await applySearchFiltersByUrl(page, query);
     } catch (error) {
-        console.warn(`⚠️ URL filter navigation failed: ${error.message}`);
+        console.warn(
+            `⚠️ URL filter navigation failed for "${query}": ${error.message}`
+        );
     }
 
+    // Physically set and verify the visible controls before collecting cards.
     await goToPostsTab(page, query);
     if (page.__nextdoorSearchRateLimited) {
         throw new Error(`NEXTDOOR_THROTTLED:120:${query}`);
@@ -1451,18 +1644,28 @@ async function searchNextdoor(page, query, targetDateLabel) {
 
     await applyMostRecentFilter(page);
 
-    const distanceApplied = await applyDistanceFilter(page, 15);
+    const distanceApplied = await applyDistanceFilter(
+        page,
+        filterConfig.miles
+    );
 
     if (page.__nextdoorSearchRateLimited) {
         throw new Error(`NEXTDOOR_THROTTLED:120:${query}`);
     }
 
     if (!distanceApplied) {
-        throw new Error("DISTANCE_FILTER_NOT_APPLIED:15 miles");
+        throw new Error(
+            `DISTANCE_FILTER_NOT_APPLIED:${filterConfig.miles} miles:${query}`
+        );
     }
 
-    await applyDateFilter(page, targetDateLabel);
+    await applyDateFilter(page, filterConfig.dateLabel);
     await sleep(1_800);
+
+    console.log(
+        `✅ Visible filters verified for "${query}": ` +
+        `${filterConfig.miles} miles + ${filterConfig.dateLabel}`
+    );
 
     const throttle = await detectNextdoorThrottle(page);
 
@@ -1478,10 +1681,7 @@ async function searchNextdoor(page, query, targetDateLabel) {
     }
 }
 
-async function collectPostLinks(
-    page,
-    limit = MAX_POSTS_PER_TERM,
-) {
+async function collectPostLinks(page, limit = MAX_POSTS_PER_TERM) {
     console.log("⬇️ Loading search results...");
 
     let previousCount = -1;
@@ -1507,78 +1707,64 @@ async function collectPostLinks(
 
     const raw = await page.evaluate((maxResults) => {
         const results = [];
+        const clean = (value) =>
+            (value || "").replace(/\s+/g, " ").trim();
 
-        const clean = (value = "") =>
-            String(value).replace(/\s+/g, " ").trim();
-
-        const anchors = document.querySelectorAll(
+        for (const anchor of document.querySelectorAll(
             'a[href*="/p/"], a[href*="/posting/"]',
-        );
-
-        for (const anchor of anchors) {
+        )) {
             const href = anchor.href;
+            if (!href) continue;
 
-            if (!href) {
-                continue;
-            }
+            const root =
+                anchor.closest("article, [role=article], li") ||
+                anchor.parentElement;
 
-            /*
-             * IMPORTANT:
-             *
-             * A Nextdoor search result can contain additional <a> tags
-             * pointing to the SAME post for comments/recommendations.
-             *
-             * The primary/original search-result card has:
-             *
-             *   data-testid="search-result-image"
-             *
-             * Comments do not.
-             *
-             * Only accept the primary result card here.
-             */
-            const primaryAvatar = anchor.querySelector(
-                '[data-testid="search-result-image"]',
+            const preview = clean(
+                root?.innerText ||
+                anchor.innerText ||
+                ""
             );
 
-            if (!primaryAvatar) {
-                continue;
-            }
-
-            // ---------------------------------------------------------
-            // AUTHOR
-            // ---------------------------------------------------------
+            if (preview.length < 15) continue;
 
             let author = null;
 
+            const avatar = root?.querySelector(
+                '[aria-label*="Avatar for" i]'
+            );
+
             const avatarLabel =
-                primaryAvatar.getAttribute("aria-label") || "";
+                avatar?.getAttribute("aria-label") || "";
 
-            const avatarMatch =
-                avatarLabel.match(/^Avatar for\s+(.+)$/i);
-
-            if (avatarMatch) {
-                author = clean(avatarMatch[1]);
+            if (avatarLabel) {
+                author = clean(
+                    avatarLabel.replace(/^Avatar for\s*/i, "")
+                );
             }
 
-            // ---------------------------------------------------------
-            // LOCATION
-            // ---------------------------------------------------------
-            //
-            // Search cards currently contain text like:
-            //
-            // Arlington, TX · 22 hr ago
-            //
-            // We specifically find that city/state pattern instead of
-            // blindly taking arbitrary styled text.
-            // ---------------------------------------------------------
+            if (!author) {
+                const profileLink = root?.querySelector(
+                    'a[href*="/profile/"]'
+                );
+
+                const profileText = clean(profileLink?.textContent);
+
+                if (
+                    profileText &&
+                    profileText.length <= 100
+                ) {
+                    author = profileText;
+                }
+            }
 
             let location = null;
             let postedAtText = null;
 
             const styledTexts = [
-                ...anchor.querySelectorAll(
-                    '[data-testid="styled-text"]',
-                ),
+                ...(root?.querySelectorAll(
+                    '[data-testid="styled-text"]'
+                ) || []),
             ]
                 .map((element) => clean(element.textContent))
                 .filter(Boolean);
@@ -1590,7 +1776,7 @@ async function collectPostLinks(
 
                 if (match) {
                     location =
-                        `${clean(match[1])}, ${match[2].toUpperCase()}`;
+                        clean(match[1]) + ", " + match[2].toUpperCase();
                     postedAtText = clean(match[3]);
                     break;
                 }
@@ -1601,60 +1787,21 @@ async function collectPostLinks(
 
                 if (locationOnly && !location) {
                     location =
-                        `${clean(locationOnly[1])}, ` +
+                        clean(locationOnly[1]) +
+                        ", " +
                         locationOnly[2].toUpperCase();
                 }
-            }
-
-            // ---------------------------------------------------------
-            // PREVIEW
-            // ---------------------------------------------------------
-
-            let preview = "";
-
-            const bodyWrappers = [
-                ...anchor.querySelectorAll(
-                    '[data-testid="styled-text-wrapper"]',
-                ),
-            ];
-
-            /*
-             * Look for the longest text wrapper. The post body tends to
-             * be substantially longer than author/location/count fields.
-             */
-            for (const wrapper of bodyWrappers) {
-                const text = clean(wrapper.textContent);
-
-                if (
-                    text.length > preview.length &&
-                    text !== author &&
-                    !/^.+,\s*[A-Z]{2}\s*·/i.test(text)
-                ) {
-                    preview = text;
-                }
-            }
-
-            if (preview.length < 15) {
-                preview = clean(anchor.innerText);
-            }
-
-            if (preview.length < 15) {
-                continue;
             }
 
             results.push({
                 url: href,
                 preview: preview.slice(0, 1_500),
-
-                // Authoritative metadata from the same search card
                 author: author || null,
                 location: location || null,
                 posted_at_text: postedAtText || null,
             });
 
-            if (results.length >= maxResults) {
-                break;
-            }
+            if (results.length >= maxResults * 3) break;
         }
 
         return results;
@@ -1699,6 +1846,8 @@ async function collectPostLinks(
         priorPosts.push(post);
         collectedByUrl.set(post.url, priorPosts);
         posts.push(post);
+
+        if (posts.length >= limit) break;
     }
 
     console.log(
@@ -1707,131 +1856,15 @@ async function collectPostLinks(
         `${reusedUrlVariants} reused-URL variant(s) preserved.`,
     );
 
-    for (const post of posts) {
-        console.log(
-            `   📍 ${post.author || "(unknown author)"} → ` +
-            `${post.location || "(unknown location)"}`,
-        );
-    }
-
     return posts;
 }
 
-const OTHER_LEAD_TABLE =
-    "unfiltered_ins_mold_pest_housecl_plumb_paint_land_lawn_handy";
-
-function normalizeDuplicateText(value) {
-    return cleanText(value || "")
-        .toLowerCase()
-        .replace(/[“”"‘’']/g, "")
-        .replace(/[^a-z0-9]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function descriptionsLookLikeSamePost(left, right) {
-    const a = normalizeDuplicateText(left);
-    const b = normalizeDuplicateText(right);
-
-    if (!a || !b) {
-        return false;
-    }
-
-    if (a === b) {
-        return true;
-    }
-
-    const shorter = a.length <= b.length ? a : b;
-    const longer = a.length <= b.length ? b : a;
-
-    // Handles edited posts where the newer version merely appends an
-    // update, while avoiding very short generic snippets.
-    if (shorter.length >= 30 && longer.includes(shorter)) {
-        return true;
-    }
-
-    const tokensA = new Set(
-        a.split(" ").filter((token) => token.length >= 3),
-    );
-    const tokensB = new Set(
-        b.split(" ").filter((token) => token.length >= 3),
-    );
-
-    if (!tokensA.size || !tokensB.size) {
-        return false;
-    }
-
-    let overlap = 0;
-
-    for (const token of tokensA) {
-        if (tokensB.has(token)) {
-            overlap += 1;
-        }
-    }
-
-    const smallerTokenCount = Math.min(
-        tokensA.size,
-        tokensB.size,
-    );
-
-    return (
-        smallerTokenCount >= 5 &&
-        overlap / smallerTokenCount >= 0.82
-    );
-}
-
-function authorsCompatibleForDuplicate(left, right) {
-    const a = normalizeDuplicateText(left);
-    const b = normalizeDuplicateText(right);
-
-    // The search card occasionally has no author. In that case the
-    // same URL + strong description match is still enough evidence.
-    if (!a || !b) {
-        return true;
-    }
-
-    return a === b;
-}
-
-function isCrossTermDuplicate(seenDuringRun, item) {
-    const url = normalizePostUrl(item.url || item.post_url);
-    const description =
-        item.preview || item.text || item.description || "";
-
-    const priorItems = seenDuringRun.get(url) || [];
-
-    const duplicate = priorItems.some((prior) =>
-        authorsCompatibleForDuplicate(
-            prior.author,
-            item.author,
-        ) &&
-        descriptionsLookLikeSamePost(
-            prior.description,
-            description,
-        )
-    );
-
-    if (duplicate) {
-        return true;
-    }
-
-    if (priorItems.length > 0) {
-        console.warn(
-            `⚠️ Same-run reused/mismatched URL not treated as cross-term duplicate: ${url}`,
-        );
-    }
-
-    priorItems.push({
-        author: item.author || null,
-        description,
-    });
-
-    seenDuringRun.set(url, priorItems);
-    return false;
-}
+const OTHER_LEAD_TABLE = "unfiltered_general_contracting";
 
 async function getExistingUrls(posts) {
-    const urls = posts.map((post) => normalizePostUrl(post.url));
+    const urls = posts
+        .map((post) => normalizePostUrl(post.url))
+        .filter(Boolean);
 
     if (!urls.length) return new Set();
 
@@ -1877,12 +1910,8 @@ async function getExistingUrls(posts) {
     for (const row of rows) {
         const url = normalizePostUrl(row.post_url);
 
-        /*
-         * This table has a post_url conflict constraint. Any URL already
-         * present here is occupied regardless of content; skipping it is
-         * safer than allowing a reused/misaligned URL to overwrite the
-         * existing row through ON CONFLICT.
-         */
+        // The destination table owns post_url. Never allow a second record
+        // with that URL to overwrite the existing row through ON CONFLICT.
         if (row.source === "current") {
             existingUrls.add(url);
             continue;
@@ -1905,11 +1934,6 @@ async function getExistingUrls(posts) {
             existingUrls.add(url);
             crossTableMatches += 1;
         } else {
-            /*
-             * We have historical evidence that Nextdoor URLs can appear
-             * with materially different content. Do not suppress a new
-             * candidate solely because another table contains the URL.
-             */
             reusedUrlMismatches += 1;
         }
     }
@@ -1922,12 +1946,227 @@ async function getExistingUrls(posts) {
 
     if (reusedUrlMismatches > 0) {
         console.warn(
-            `⚠️ Reused/mismatched Nextdoor URL(s) not treated as duplicates: ` +
+            `⚠️ Reused/mismatched historical URL(s) not treated as duplicates: ` +
             `${reusedUrlMismatches}.`,
         );
     }
 
     return existingUrls;
+}
+
+
+async function ensureGeneralContractingAuditTables() {
+    // Uses the same proven audit schema as the combined scraper, while
+    // keeping general contracting runs separate from combined runs.
+    await pool.query(`CREATE TABLE IF NOT EXISTS ${SEARCH_RUNS_TABLE}
+        (LIKE combined_search_runs INCLUDING ALL)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS ${SEARCH_RESULTS_TABLE}
+        (LIKE combined_search_results INCLUDING ALL)`);
+}
+
+async function purgeExpiredSearchHistory() {
+    const resultDelete = await pool.query(
+        `
+            DELETE FROM ${SEARCH_RESULTS_TABLE}
+            WHERE expires_at < NOW()
+        `,
+    );
+
+    const runDelete = await pool.query(
+        `
+            DELETE FROM ${SEARCH_RUNS_TABLE} r
+            WHERE r.started_at < NOW() - INTERVAL '35 days'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM ${SEARCH_RESULTS_TABLE} s
+                  WHERE s.run_id = r.run_id
+              )
+        `,
+    );
+
+    console.log(
+        `🧹 Search-history cleanup: ${resultDelete.rowCount} observation(s) ` +
+        `and ${runDelete.rowCount} old run(s) removed.`,
+    );
+}
+
+async function createSearchRun(
+    runId,
+    plannedSearchTerms =
+    SEARCH_TERMS.length,
+) {
+    await pool.query(
+        `
+            INSERT INTO ${SEARCH_RUNS_TABLE}
+            (
+                run_id,
+                status,
+                planned_search_terms
+            )
+            VALUES ($1, 'running', $2)
+            ON CONFLICT (run_id) DO NOTHING
+        `,
+        [
+            runId,
+            plannedSearchTerms,
+        ],
+    );
+
+    console.log(
+        `🧠 Search-learning run started: ${runId} ` +
+        `(${plannedSearchTerms} term(s)).`,
+    );
+}
+
+async function finishSearchRun(runId, status, totals, error = null) {
+    await pool.query(
+        `
+            UPDATE ${SEARCH_RUNS_TABLE}
+            SET
+                completed_at = NOW(),
+                status = $2,
+                total_result_observations = $3,
+                total_unique_result_urls = $4,
+                total_existing_posts = $5,
+                total_cross_term_duplicates = $6,
+                total_new_candidates = $7,
+                total_inserted = $8,
+                total_failed = $9,
+                run_error = $10
+            WHERE run_id = $1
+        `,
+        [
+            runId,
+            status,
+            totals.resultObservations || 0,
+            totals.uniqueResultUrls || 0,
+            totals.existingSkipped || 0,
+            totals.crossTermSkipped || 0,
+            totals.newCandidates || 0,
+            totals.inserted || 0,
+            totals.failed || 0,
+            error ? String(error).slice(0, 4000) : null,
+        ],
+    );
+}
+
+async function logSearchObservations({
+                                         runId,
+                                         query,
+                                         expectedLeadTypes,
+                                         posts,
+                                         existingUrls,
+                                         crossTermUrls,
+                                     }) {
+    if (!posts.length) return 0;
+
+    const values = [];
+    const placeholders = [];
+
+    // Audit rows are uniquely keyed by URL. Multiple cards can still be
+    // processed downstream, but inserting the same conflict key twice in one
+    // PostgreSQL statement fails with SQLSTATE 21000.
+    const auditedUrls = new Set();
+    let repeatedAuditUrls = 0;
+    posts.forEach((post, index) => {
+        const base = values.length;
+        const postUrl = normalizePostUrl(post.url);
+        if (auditedUrls.has(postUrl)) {
+            repeatedAuditUrls += 1;
+            return;
+        }
+        auditedUrls.add(postUrl);
+
+
+        values.push(
+            runId,
+            query,
+            expectedLeadTypes,
+            SEARCH_TERM_SOURCE,
+            index + 1,
+            postUrl,
+            cleanText(post.preview || "").slice(0, 1500) || null,
+            existingUrls.has(postUrl),
+            crossTermUrls.has(postUrl),
+        );
+
+        placeholders.push(
+            `($${base + 1}, $${base + 2}, $${base + 3}::text[], ` +
+            `$${base + 4}, $${base + 5}, $${base + 6}, ` +
+            `$${base + 7}, $${base + 8}, $${base + 9})`,
+        );
+    });
+
+    if (repeatedAuditUrls > 0) {
+        console.warn(`🧾 Search audit: ${repeatedAuditUrls} additional card variant(s) share a URL; audit stores one row per URL, while candidate processing remains unchanged.`);
+    }
+
+    await pool.query(
+        `
+            INSERT INTO ${SEARCH_RESULTS_TABLE}
+            (
+                run_id,
+                search_term,
+                expected_lead_types,
+                term_source,
+                result_position,
+                post_url,
+                preview,
+                was_existing,
+                cross_term_duplicate
+            )
+            VALUES ${placeholders.join(",\n")}
+            ON CONFLICT (run_id, search_term, post_url)
+            DO UPDATE SET
+                expected_lead_types = EXCLUDED.expected_lead_types,
+                term_source = EXCLUDED.term_source,
+                result_position = EXCLUDED.result_position,
+                preview = EXCLUDED.preview,
+                was_existing = EXCLUDED.was_existing,
+                cross_term_duplicate = EXCLUDED.cross_term_duplicate
+        `,
+        values,
+    );
+
+    console.log(
+        `📝 Search audit: recorded all ${posts.length} result observation(s) ` +
+        `for "${query}" before duplicate filtering.`,
+    );
+
+    return posts.length;
+}
+
+async function markAuditInserted(runId, query, postUrl, leadId) {
+    await pool.query(
+        `
+            UPDATE ${SEARCH_RESULTS_TABLE}
+            SET inserted_new = TRUE,
+                inserted_lead_id = $4,
+                scraper_error = NULL
+            WHERE run_id = $1
+              AND search_term = $2
+              AND post_url = $3
+        `,
+        [runId, query, normalizePostUrl(postUrl), leadId],
+    );
+}
+
+async function markAuditError(runId, query, postUrl, error) {
+    await pool.query(
+        `
+            UPDATE ${SEARCH_RESULTS_TABLE}
+            SET scraper_error = $4
+            WHERE run_id = $1
+              AND search_term = $2
+              AND post_url = $3
+        `,
+        [
+            runId,
+            query,
+            normalizePostUrl(postUrl),
+            String(error || "unknown error").slice(0, 2000),
+        ],
+    );
 }
 
 async function expandSeeMore(page) {
@@ -1990,6 +2229,7 @@ async function extractAuthor(page) {
     return null;
 }
 
+
 async function extractPostDetails(detailPage, post, searchTerm) {
     const url = normalizePostUrl(post.url);
 
@@ -2009,9 +2249,7 @@ async function extractPostDetails(detailPage, post, searchTerm) {
     await sleep(1_400);
     await expandSeeMore(detailPage);
 
-    const author =
-        post.author ||
-        await extractAuthor(detailPage);
+    const author = await extractAuthor(detailPage);
 
     const extracted = await detailPage.evaluate(
         ({ preview }) => {
@@ -2121,15 +2359,15 @@ async function extractPostDetails(detailPage, post, searchTerm) {
     );
 
     const location = cleanText(
-        post.location ||
-        extracted.location ||
-        "",
+        extracted.location || "",
     );
 
     const cityState = await resolveCityState({
         location,
         description,
     });
+
+    const leadTypes = getLeadTypesForSearchTerm(searchTerm);
 
     return {
         author,
@@ -2138,7 +2376,7 @@ async function extractPostDetails(detailPage, post, searchTerm) {
         post_url: url,
         city: cityState.city,
         state: cityState.state,
-        lead_type: ["general_contracting"],
+        lead_type: leadTypes,
         search_term: searchTerm,
         posted_at_text: post.posted_at_text || null,
         posted_at: (() => {
@@ -2148,6 +2386,7 @@ async function extractPostDetails(detailPage, post, searchTerm) {
         })(),
     };
 }
+
 
 async function insertUnfilteredGeneralContracting(record) {
     const query = `
@@ -2226,694 +2465,16 @@ async function insertUnfilteredGeneralContracting(record) {
         record.posted_at_text || null,
     ]);
 
-    const insertedId = rows[0]?.id || null;
-
     console.log(
         `✅ Saved: ${record.author || "(unknown)"} → ` +
         `${record.city || "(unknown city)"}, ` +
-        `${record.state || "(unknown state)"}` +
-        `${insertedId ? ` (id=${insertedId})` : ""}`,
+        `${record.state || "(unknown state)"}`,
     );
 
-    return insertedId;
+    return rows[0]?.id || null;
 }
 
-
-function normalizeSearchTerm(term) {
-    return cleanText(term)
-        .toLowerCase()
-        .replace(/[“”]/g, '"')
-        .replace(/[‘’]/g, "'");
-}
-
-function validSearchTerm(term) {
-    const clean = cleanText(term);
-
-    return (
-        clean.length >= 3 &&
-        clean.length <= 70 &&
-        clean.split(/\s+/).length <= 9 &&
-        /^[A-Za-z0-9&'’()./\-\s]+$/.test(clean)
-    );
-}
-
-function dedupePlanEntries(entries) {
-    const seen = new Set();
-    const output = [];
-
-    for (const entry of entries) {
-        const query = cleanText(entry?.query || entry);
-        const key = normalizeSearchTerm(query);
-
-        if (!key || seen.has(key) || !validSearchTerm(query)) {
-            continue;
-        }
-
-        seen.add(key);
-        output.push({
-            query,
-            source: entry?.source || "unknown",
-        });
-    }
-
-    return output;
-}
-
-function numeric(value) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function scoreHistoricalTerm(row) {
-    const observations = Math.max(1, numeric(row.observations));
-    const uniquePosts = numeric(row.unique_posts);
-    const freshCandidates = numeric(row.fresh_candidates);
-    const inserted = numeric(row.new_posts_inserted);
-    const leads = numeric(row.actual_leads);
-    const ftnMatches = numeric(row.ftn_matches);
-    const existing = numeric(row.existing_observations);
-
-    const leadRate = leads / Math.max(1, inserted);
-    const freshRate = freshCandidates / observations;
-    const staleRate = existing / observations;
-
-    return (
-        leads * 25 +
-        ftnMatches * 12 +
-        inserted * 5 +
-        uniquePosts * 0.25 +
-        leadRate * 20 +
-        freshRate * 8 -
-        staleRate * 5
-    );
-}
-
-async function purgeExpiredSearchHistory() {
-    const resultDelete = await pool.query(
-        `
-            DELETE FROM ${SEARCH_RESULTS_TABLE}
-            WHERE expires_at < NOW()
-        `,
-    );
-
-    const runDelete = await pool.query(
-        `
-            DELETE FROM ${SEARCH_RUNS_TABLE} r
-            WHERE r.started_at < NOW() - INTERVAL '35 days'
-              AND NOT EXISTS (
-                SELECT 1
-                FROM ${SEARCH_RESULTS_TABLE} s
-                WHERE s.run_id = r.run_id
-                )
-        `,
-    );
-
-    console.log(
-        `🧹 Search-history cleanup: ${resultDelete.rowCount} observation(s) ` +
-        `and ${runDelete.rowCount} old run(s) removed.`,
-    );
-}
-
-async function getHistoricalTermPerformance() {
-    const { rows } = await pool.query(
-        `
-            SELECT
-                r.search_term,
-                COUNT(DISTINCT r.run_id)::int AS search_runs,
-                COUNT(*)::int AS observations,
-                COUNT(DISTINCT r.post_url)::int AS unique_posts,
-                COUNT(*) FILTER (
-                    WHERE r.was_existing = TRUE
-                )::int AS existing_observations,
-                COUNT(*) FILTER (
-                    WHERE r.cross_term_duplicate = TRUE
-                )::int AS cross_term_duplicates,
-                COUNT(*) FILTER (
-                    WHERE r.was_existing = FALSE
-                      AND r.cross_term_duplicate = FALSE
-                )::int AS fresh_candidates,
-                COUNT(DISTINCT r.post_url) FILTER (
-                    WHERE r.inserted_new = TRUE
-                )::int AS new_posts_inserted,
-                COUNT(DISTINCT g.id) FILTER (
-                    WHERE g.is_lead = TRUE
-                )::int AS actual_leads,
-                COUNT(DISTINCT f.lead_id)::int AS ftn_matches,
-                MAX(r.searched_at) AS last_searched_at
-            FROM ${SEARCH_RESULTS_TABLE} r
-                     LEFT JOIN ${TABLE_NAME} g
-                               ON g.post_url = r.post_url
-                     LEFT JOIN familytreenow f
-                               ON f.lead_id = g.id
-            WHERE r.searched_at >=
-                  NOW() - ($1::text || ' days')::interval
-            GROUP BY r.search_term
-        `,
-        [String(SEARCH_HISTORY_DAYS)],
-    );
-
-    return rows.map((row) => ({
-        ...row,
-        score: scoreHistoricalTerm(row),
-    }));
-}
-
-async function getRecentlySearchedTerms(days = SONAR_COOLDOWN_DAYS) {
-    const { rows } = await pool.query(
-        `
-            SELECT DISTINCT search_term
-            FROM ${SEARCH_RESULTS_TABLE}
-            WHERE searched_at >=
-                  NOW() - ($1::text || ' days')::interval
-        `,
-        [String(days)],
-    );
-
-    return new Set(
-        rows.map((row) => normalizeSearchTerm(row.search_term)),
-    );
-}
-
-function extractJsonObject(text) {
-    const raw = cleanText(text);
-
-    try {
-        return JSON.parse(raw);
-    } catch {}
-
-    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-
-    if (fenced) {
-        try {
-            return JSON.parse(fenced);
-        } catch {}
-    }
-
-    const first = raw.indexOf("{");
-    const last = raw.lastIndexOf("}");
-
-    if (first >= 0 && last > first) {
-        try {
-            return JSON.parse(raw.slice(first, last + 1));
-        } catch {}
-    }
-
-    throw new Error("Sonar response did not contain valid JSON.");
-}
-
-async function requestSonarExplorationTerms({
-                                                performance,
-                                                recentTerms,
-                                                excludedTerms,
-                                                count,
-                                            }) {
-    if (!PPLX_API_KEY || count <= 0) {
-        return {
-            terms: [],
-            used: false,
-            error: PPLX_API_KEY
-                ? null
-                : "No Perplexity/Sonar API key configured.",
-        };
-    }
-
-    const ranked = [...performance]
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 30)
-        .map((row) => ({
-            term: row.search_term,
-            runs: numeric(row.search_runs),
-            observations: numeric(row.observations),
-            unique_posts: numeric(row.unique_posts),
-            fresh_candidates: numeric(row.fresh_candidates),
-            new_posts_inserted: numeric(row.new_posts_inserted),
-            actual_leads: numeric(row.actual_leads),
-            ftn_matches: numeric(row.ftn_matches),
-            existing_observations: numeric(row.existing_observations),
-        }));
-
-    const recent = [...recentTerms].slice(0, 80);
-    const excluded = [...excludedTerms].slice(0, 50);
-
-    const systemPrompt = [
-        "You generate short Nextdoor search queries for finding homeowners who are actively looking for residential general-contracting work.",
-        "Focus on natural homeowner language, not SEO phrases.",
-        "Relevant work includes general contractors, remodeling, additions, foundations, structural repairs, kitchens, bathrooms, decks, fences, framing, concrete, masonry, patios, porches, garages, and major home repairs.",
-        "Avoid commercial construction, jobs/employment, contractor self-promotion, real-estate listings, DIY-only questions, and generic home-service categories that are not general contracting.",
-        "Return JSON only with this exact shape: {\"terms\":[\"term 1\",\"term 2\"]}.",
-    ].join(" ");
-
-    const userPrompt = [
-        `Generate exactly ${count} NEW search queries for the next scraper run.`,
-        "Do not repeat the anchor/winner terms or terms searched during the cooldown window unless there is no reasonable alternative.",
-        "Use the historical performance to explore adjacent homeowner wording around categories that have produced actual leads, while also testing genuinely new phrases.",
-        "Keep each query concise (usually 2-5 words, never more than 9).",
-        "",
-        `ANCHOR/WINNER TERMS TO EXCLUDE: ${JSON.stringify(excluded)}`,
-        `RECENTLY SEARCHED TERMS TO AVOID: ${JSON.stringify(recent)}`,
-        `30-DAY PERFORMANCE: ${JSON.stringify(ranked)}`,
-    ].join("\n");
-
-    console.log(
-        `🧠 Asking Sonar (${PPLX_MODEL}) for ${count} exploratory GC search term(s)...`,
-    );
-
-    const response = await fetch(PPLX_API_URL, {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${PPLX_API_KEY}`,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-            model: PPLX_MODEL,
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: userPrompt },
-            ],
-            temperature: 0.65,
-            max_tokens: 700,
-        }),
-        signal: AbortSignal.timeout(
-            Math.max(
-                10_000,
-                Number(process.env.GC_SONAR_TIMEOUT_MS || 45_000),
-            ),
-        ),
-    });
-
-    const bodyText = await response.text();
-
-    if (!response.ok) {
-        throw new Error(
-            `Sonar HTTP ${response.status}: ${bodyText.slice(0, 500)}`,
-        );
-    }
-
-    let body;
-
-    try {
-        body = JSON.parse(bodyText);
-    } catch {
-        throw new Error("Sonar returned a non-JSON API response.");
-    }
-
-    const content = body?.choices?.[0]?.message?.content;
-
-    if (!content) {
-        throw new Error("Sonar response did not include message content.");
-    }
-
-    const parsed = extractJsonObject(content);
-    const rawTerms = Array.isArray(parsed?.terms) ? parsed.terms : [];
-
-    const terms = [];
-    const localSeen = new Set();
-
-    for (const rawTerm of rawTerms) {
-        const term = cleanText(rawTerm);
-        const key = normalizeSearchTerm(term);
-
-        if (
-            !validSearchTerm(term) ||
-            !key ||
-            localSeen.has(key) ||
-            excludedTerms.has(key) ||
-            recentTerms.has(key)
-        ) {
-            continue;
-        }
-
-        localSeen.add(key);
-        terms.push(term);
-
-        if (terms.length >= count) break;
-    }
-
-    return {
-        terms,
-        used: true,
-        error: null,
-    };
-}
-
-async function buildAdaptiveSearchPlan() {
-    console.log("");
-    console.log("============================================================");
-    console.log("🧠 Building adaptive general-contracting search strategy...");
-    console.log("============================================================");
-
-    const performance = await getHistoricalTermPerformance();
-    const performanceByTerm = new Map(
-        performance.map((row) => [
-            normalizeSearchTerm(row.search_term),
-            row,
-        ]),
-    );
-
-    const anchors = dedupePlanEntries(
-        ANCHOR_TERMS.map((query) => ({
-            query,
-            source: "anchor",
-        })),
-    );
-
-    const anchorKeys = new Set(
-        anchors.map((entry) => normalizeSearchTerm(entry.query)),
-    );
-
-    const winners = [...performance]
-        .filter((row) => !anchorKeys.has(normalizeSearchTerm(row.search_term)))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, WINNER_TERM_COUNT)
-        .map((row) => ({
-            query: row.search_term,
-            source: "winner",
-        }));
-
-    const selectedBeforeSonar = dedupePlanEntries([
-        ...anchors,
-        ...winners,
-    ]);
-
-    const excludedTerms = new Set(
-        selectedBeforeSonar.map((entry) =>
-            normalizeSearchTerm(entry.query),
-        ),
-    );
-
-    const recentTerms = await getRecentlySearchedTerms();
-
-    let sonar = {
-        terms: [],
-        used: false,
-        error: null,
-    };
-
-    try {
-        sonar = await requestSonarExplorationTerms({
-            performance,
-            recentTerms,
-            excludedTerms,
-            count: SONAR_TERM_COUNT,
-        });
-    } catch (error) {
-        sonar = {
-            terms: [],
-            used: true,
-            error: getErrorMessage(error),
-        };
-
-        console.warn(
-            `⚠️ Sonar search-term generation failed: ${sonar.error}`,
-        );
-    }
-
-    const exploration = sonar.terms.map((query) => ({
-        query,
-        source: "sonar",
-    }));
-
-    const currentlySelected = new Set([
-        ...excludedTerms,
-        ...exploration.map((entry) => normalizeSearchTerm(entry.query)),
-    ]);
-
-    for (const candidate of DEFAULT_EXPLORATION_TERMS) {
-        if (exploration.length >= SONAR_TERM_COUNT) break;
-
-        const key = normalizeSearchTerm(candidate);
-
-        if (
-            !key ||
-            currentlySelected.has(key) ||
-            recentTerms.has(key)
-        ) {
-            continue;
-        }
-
-        currentlySelected.add(key);
-        exploration.push({
-            query: candidate,
-            source: "fallback",
-        });
-    }
-
-    // A cooldown can eventually cover the entire fallback list. In that case,
-    // fill the remaining slots from the fallback pool anyway rather than run
-    // too few searches.
-    for (const candidate of DEFAULT_EXPLORATION_TERMS) {
-        if (exploration.length >= SONAR_TERM_COUNT) break;
-
-        const key = normalizeSearchTerm(candidate);
-
-        if (!key || currentlySelected.has(key)) continue;
-
-        currentlySelected.add(key);
-        exploration.push({
-            query: candidate,
-            source: "fallback",
-        });
-    }
-
-    const plan = dedupePlanEntries([
-        ...selectedBeforeSonar,
-        ...exploration,
-    ]);
-
-    console.log(
-        `📌 Anchor terms (${anchors.length}): ` +
-        anchors.map((entry) => `"${entry.query}"`).join(", "),
-    );
-    console.log(
-        `🏆 Historical winners (${winners.length}): ` +
-        (winners.length
-            ? winners.map((entry) => `"${entry.query}"`).join(", ")
-            : "none yet"),
-    );
-    console.log(
-        `🧪 Exploration terms (${exploration.length}): ` +
-        (exploration.length
-            ? exploration
-                .map((entry) => `"${entry.query}" [${entry.source}]`)
-                .join(", ")
-            : "none"),
-    );
-    console.log(`🔎 Total searches scheduled: ${plan.length}`);
-
-    if (sonar.error) {
-        console.log(`ℹ️ Sonar fallback reason: ${sonar.error}`);
-    }
-
-    return {
-        plan,
-        performance,
-        performanceByTerm,
-        sonarUsed: sonar.used && sonar.terms.length > 0,
-        sonarError: sonar.error,
-        anchorCount: anchors.length,
-        winnerCount: winners.length,
-        sonarCount: exploration.filter((entry) => entry.source === "sonar").length,
-        fallbackCount: exploration.filter((entry) => entry.source === "fallback").length,
-    };
-}
-
-async function createSearchRun(runId, strategy) {
-    await pool.query(
-        `
-            INSERT INTO ${SEARCH_RUNS_TABLE}
-            (
-                run_id,
-                status,
-                planned_search_terms,
-                anchor_terms_count,
-                winner_terms_count,
-                sonar_terms_count,
-                fallback_terms_count,
-                sonar_used,
-                sonar_error
-            )
-            VALUES ($1, 'running', $2, $3, $4, $5, $6, $7, $8)
-                ON CONFLICT (run_id) DO NOTHING
-        `,
-        [
-            runId,
-            strategy.plan.length,
-            strategy.anchorCount,
-            strategy.winnerCount,
-            strategy.sonarCount,
-            strategy.fallbackCount,
-            strategy.sonarUsed,
-            strategy.sonarError,
-        ],
-    );
-}
-
-async function finishSearchRun(runId, status, totals, error = null) {
-    await pool.query(
-        `
-            UPDATE ${SEARCH_RUNS_TABLE}
-            SET
-                completed_at = NOW(),
-                status = $2,
-                total_result_observations = $3,
-                total_unique_result_urls = $4,
-                total_existing_posts = $5,
-                total_cross_term_duplicates = $6,
-                total_new_candidates = $7,
-                total_inserted = $8,
-                total_failed = $9,
-                run_error = $10
-            WHERE run_id = $1
-        `,
-        [
-            runId,
-            status,
-            totals.resultObservations || 0,
-            totals.uniqueResultUrls || 0,
-            totals.existingSkipped || 0,
-            totals.crossTermSkipped || 0,
-            totals.newCandidates || 0,
-            totals.inserted || 0,
-            totals.failed || 0,
-            error,
-        ],
-    );
-}
-
-async function logSearchObservations({
-                                         runId,
-                                         query,
-                                         termSource,
-                                         posts,
-                                         existingUrls,
-                                         crossTermUrls,
-                                     }) {
-    if (!posts.length) return 0;
-
-    const values = [];
-    const placeholders = [];
-
-    // Audit rows are uniquely keyed by URL. Multiple cards can still be
-    // processed downstream, but inserting the same conflict key twice in one
-    // PostgreSQL statement fails with SQLSTATE 21000.
-    const auditedUrls = new Set();
-    let repeatedAuditUrls = 0;
-    posts.forEach((post, index) => {
-        const base = values.length;
-        const postUrl = normalizePostUrl(post.url);
-        if (auditedUrls.has(postUrl)) {
-            repeatedAuditUrls += 1;
-            return;
-        }
-        auditedUrls.add(postUrl);
-
-
-        values.push(
-            runId,
-            query,
-            termSource,
-            index + 1,
-            postUrl,
-            cleanText(post.preview || "").slice(0, 1500) || null,
-            existingUrls.has(postUrl),
-            crossTermUrls.has(postUrl),
-        );
-
-        placeholders.push(
-            `($${base + 1}, $${base + 2}, $${base + 3}, ` +
-            `$${base + 4}, $${base + 5}, $${base + 6}, ` +
-            `$${base + 7}, $${base + 8})`,
-        );
-    });
-
-    if (repeatedAuditUrls > 0) {
-        console.warn(`🧾 Search audit: ${repeatedAuditUrls} additional card variant(s) share a URL; audit stores one row per URL, while candidate processing remains unchanged.`);
-    }
-
-    await pool.query(
-        `
-            INSERT INTO ${SEARCH_RESULTS_TABLE}
-            (
-                run_id,
-                search_term,
-                term_source,
-                result_position,
-                post_url,
-                preview,
-                was_existing,
-                cross_term_duplicate
-            )
-            VALUES ${placeholders.join(",\n")}
-                ON CONFLICT (run_id, search_term, post_url)
-            DO UPDATE SET
-                result_position = EXCLUDED.result_position,
-                                   preview = EXCLUDED.preview,
-                                   was_existing = EXCLUDED.was_existing,
-                                   cross_term_duplicate = EXCLUDED.cross_term_duplicate
-        `,
-        values,
-    );
-
-    console.log(
-        `📝 Search audit: recorded all ${posts.length} result observation(s) ` +
-        `before duplicate filtering.`,
-    );
-
-    return posts.length;
-}
-
-async function markAuditInserted(runId, query, postUrl, leadId) {
-    await pool.query(
-        `
-            UPDATE ${SEARCH_RESULTS_TABLE}
-            SET inserted_new = TRUE,
-                inserted_lead_id = $4
-            WHERE run_id = $1
-              AND search_term = $2
-              AND post_url = $3
-        `,
-        [runId, query, normalizePostUrl(postUrl), leadId],
-    );
-}
-
-async function markAuditError(runId, query, postUrl, error) {
-    await pool.query(
-        `
-            UPDATE ${SEARCH_RESULTS_TABLE}
-            SET scraper_error = $4
-            WHERE run_id = $1
-              AND search_term = $2
-              AND post_url = $3
-        `,
-        [
-            runId,
-            query,
-            normalizePostUrl(postUrl),
-            String(error || "unknown error").slice(0, 2000),
-        ],
-    );
-}
-
-function printTermHistory(query, performanceByTerm) {
-    const row = performanceByTerm.get(normalizeSearchTerm(query));
-
-    if (!row) {
-        console.log("📈 30-day history: new/unmeasured search term.");
-        return;
-    }
-
-    console.log(
-        `📈 30-day history: runs=${numeric(row.search_runs)} | ` +
-        `observations=${numeric(row.observations)} | ` +
-        `unique=${numeric(row.unique_posts)} | ` +
-        `fresh=${numeric(row.fresh_candidates)} | ` +
-        `inserted=${numeric(row.new_posts_inserted)} | ` +
-        `leads=${numeric(row.actual_leads)} | ` +
-        `FTN=${numeric(row.ftn_matches)}`,
-    );
-}
-
-async function collectPostsForSearchTerm(context, query, termSource) {
+async function collectPostsForSearchTerm(context, query) {
     let lastError = null;
 
     for (
@@ -2936,14 +2497,7 @@ async function collectPostsForSearchTerm(context, query, termSource) {
                 `search:${query}:attempt:${attempt}`,
             );
 
-            const targetDateLabel =
-                getDateFilterForTermSource(termSource);
-
-            await searchNextdoor(
-                searchPage,
-                query,
-                targetDateLabel,
-            );
+            await searchNextdoor(searchPage, query);
 
             const posts = await collectPostLinks(
                 searchPage,
@@ -2960,6 +2514,7 @@ async function collectPostsForSearchTerm(context, query, termSource) {
             }
 
             return posts;
+
         } catch (error) {
             lastError = error;
 
@@ -2973,6 +2528,8 @@ async function collectPostsForSearchTerm(context, query, termSource) {
                 );
             }
 
+            // A throttle should NOT be retried.
+            // Let it bubble up to the main search loop so the whole run stops.
             if (isNextdoorThrottleError(error)) {
                 throw error;
             }
@@ -2993,6 +2550,7 @@ async function collectPostsForSearchTerm(context, query, termSource) {
 
                 await sleep(delayMs);
             }
+
         } finally {
             await closePageSafely(
                 searchPage,
@@ -3098,19 +2656,22 @@ async function extractPostDetailsWithFreshPage(
     );
 }
 
+
 async function processSearchTerm({
                                      context,
                                      query,
-                                     termSource,
                                      runId,
                                      seenDuringRun,
                                  }) {
+    const expectedLeadTypes = getLeadTypesForSearchTerm(query);
+
     const allPosts = await collectPostsForSearchTerm(
         context,
         query,
-        termSource,
     );
 
+    // Check all results before cross-term filtering
+    // so the audit captures existing database records.
     const existingAll = await getExistingUrls(allPosts);
     const crossTermUrls = new Set();
     const uniqueForThisRun = [];
@@ -3126,22 +2687,26 @@ async function processSearchTerm({
         uniqueForThisRun.push(post);
     }
 
-    const auditRows = await logSearchObservations({
+    await logSearchObservations({
         runId,
         query,
-        termSource,
+        expectedLeadTypes,
         posts: allPosts,
         existingUrls: existingAll,
         crossTermUrls,
     });
 
     console.log(
-        `🔁 Cross-term duplicate check: ` +
-        `${crossTermUrls.size} already found during this run, ` +
-        `${uniqueForThisRun.length} remain.`,
+        `🔎 Search "${query}" → ${expectedLeadTypes.join(", ") || "unclassified"}`
     );
 
-    const existingUnique = new Set(
+    console.log(
+        `🔁 Cross-term duplicate check: ` +
+        `${crossTermUrls.size} already found ` +
+        `during this run, ${uniqueForThisRun.length} remain.`,
+    );
+
+    const existing = new Set(
         uniqueForThisRun
             .map((post) => normalizePostUrl(post.url))
             .filter((url) => existingAll.has(url)),
@@ -3154,7 +2719,7 @@ async function processSearchTerm({
 
     console.log(
         `🧱 Database duplicate check: ` +
-        `${existingUnique.size} existing, ${posts.length} new candidate(s).`,
+        `${existing.size} existing, ${posts.length} new.`,
     );
 
     let inserted = 0;
@@ -3183,13 +2748,16 @@ async function processSearchTerm({
                 record.description.length < 10
             ) {
                 console.log("⏭️ No usable description.");
+
+                failed += 1;
+
                 await markAuditError(
                     runId,
                     query,
                     post.url,
                     "No usable description",
                 );
-                failed += 1;
+
                 continue;
             }
 
@@ -3215,7 +2783,8 @@ async function processSearchTerm({
             const message = getErrorMessage(error);
 
             console.error(
-                `⏭️ Skipping post after fresh-page retries: ${message}`,
+                `⏭️ Skipping post after fresh-page retries: ` +
+                `${message}`,
             );
 
             await markAuditError(
@@ -3223,7 +2792,12 @@ async function processSearchTerm({
                 query,
                 post.url,
                 message,
-            ).catch(() => {});
+            ).catch((auditError) => {
+                console.warn(
+                    `⚠️ Could not record audit error for ${post.url}: ` +
+                    `${getErrorMessage(auditError)}`,
+                );
+            });
 
             failed += 1;
         }
@@ -3233,26 +2807,19 @@ async function processSearchTerm({
         );
     }
 
-    console.log("");
-    console.log("📊 TERM RESULT");
-    console.log(`   Search term: ${query}`);
-    console.log(`   Source: ${termSource}`);
-    console.log(`   Result observations logged: ${auditRows}`);
-    console.log(`   Cross-term duplicates: ${crossTermUrls.size}`);
-    console.log(`   Existing DB posts: ${existingUnique.size}`);
-    console.log(`   New candidates: ${posts.length}`);
-    console.log(`   Inserted: ${inserted}`);
-    console.log(`   Failed: ${failed}`);
-
     return {
         inserted,
         failed,
-        auditRows,
-        newCandidates: posts.length,
-        existingSkipped: existingUnique.size,
+        existingSkipped: existing.size,
         crossTermSkipped: crossTermUrls.size,
+        newCandidates: posts.length,
+        resultObservations: allPosts.length,
+        observedUrls: allPosts.map((post) =>
+            normalizePostUrl(post.url),
+        ),
     };
 }
+
 
 async function triggerFtnEnrichment({
                                         totalInserted,
@@ -3276,7 +2843,7 @@ async function triggerFtnEnrichment({
 
     const payload = {
         source_table: TABLE_NAME,
-        lead_type: ["general_contracting"],
+        lead_type: LEAD_TYPES,
         scrape_summary: {
             inserted: totalInserted,
             failed: totalFailed,
@@ -3414,81 +2981,43 @@ async function triggerFtnEnrichment({
 
 async function main() {
     console.log(
-        "🏗️ Nextdoor Adaptive General Contracting Scraper Started",
+        "🏗️ Nextdoor General Contractor Scraper Started",
     );
 
     if (!process.env.MULTILOGIN_WS) {
         throw new Error("MULTILOGIN_WS is missing.");
     }
 
-    const runId = crypto.randomUUID();
-    const totals = {
-        inserted: 0,
-        failed: 0,
-        existingSkipped: 0,
-        crossTermSkipped: 0,
-        newCandidates: 0,
-        resultObservations: 0,
-        uniqueResultUrls: 0,
-    };
+    const runId = randomUUID();
 
     let browser = null;
     let bootstrapPage = null;
-    let searchRunFinalized = false;
+    let searchRunCreated = false;
+    let searchRunFinished = false;
+
+    const observedUrlsDuringRun = new Set();
+
+    let totalResultObservations = 0;
+    let totalNewCandidates = 0;
+    let totalInserted = 0;
+    let totalFailed = 0;
+    let totalExistingSkipped = 0;
+    let totalCrossTermSkipped = 0;
+
+    const currentTotals = () => ({
+        resultObservations: totalResultObservations,
+        uniqueResultUrls: observedUrlsDuringRun.size,
+        existingSkipped: totalExistingSkipped,
+        crossTermSkipped: totalCrossTermSkipped,
+        newCandidates: totalNewCandidates,
+        inserted: totalInserted,
+        failed: totalFailed,
+    });
 
     try {
+        await ensureGeneralContractingAuditTables();
         await purgeExpiredSearchHistory();
 
-        const strategy = await buildAdaptiveSearchPlan();
-
-        const carryoverTerms =
-            await fetchCarryoverSearchTerms();
-
-        const carryoverKeys = new Set(
-            carryoverTerms.map((entry) =>
-                normalizeSearchTerm(entry.query),
-            ),
-        );
-
-        const normalTerms = strategy.plan.filter(
-            (entry) =>
-                !carryoverKeys.has(
-                    normalizeSearchTerm(entry.query),
-                ),
-        );
-
-        const randomizedCarryover =
-            shuffleArray(carryoverTerms);
-
-        const randomizedNormal =
-            shuffleArray(normalTerms);
-
-        const executionPlan = [
-            ...randomizedCarryover,
-            ...randomizedNormal,
-        ];
-
-        const runStrategy = {
-            ...strategy,
-            plan: executionPlan,
-        };
-
-        await createSearchRun(runId, runStrategy);
-
-        console.log(`🆔 GC search run: ${runId}`);
-        console.log(
-            `♻️ Carryover terms prioritized: ${randomizedCarryover.length}`,
-        );
-        console.log(
-            `🔀 Normal adaptive terms randomized after carryover: ${randomizedNormal.length}`,
-        );
-        console.log(
-            `📋 Final general contractor execution plan: ${executionPlan.length} term(s).`,
-        );
-        console.log(
-            "🔀 Search order this run:",
-            executionPlan.map((entry) => entry.query),
-        );
 
         browser = await chromium.connectOverCDP(
             process.env.MULTILOGIN_WS,
@@ -3509,27 +3038,96 @@ async function main() {
             );
         }
 
-        // Use the combined scraper's safer lifecycle: validate one bootstrap
-        // page, close stale restored tabs, then use disposable pages for each
-        // search and each new-post detail extraction.
+        // Confirm the saved Multilogin profile is logged in before opening
+        // disposable pages for each search term and each new post.
         bootstrapPage = await waitForNextdoorReady(
             context,
             180_000,
         );
 
+        // Multilogin restores tabs from the previous profile session. The log
+        // showed 16 pages open before scraping began, which can exhaust the
+        // container's PID/thread allowance even when each new page is closed.
         await closeStaleContextPages(context, bootstrapPage);
         await parkBootstrapPage(bootstrapPage);
 
         const seenDuringRun = new Map();
 
+        const carryoverTerms =
+            await fetchCarryoverSearchTerms();
+
+        const carryoverKeys =
+            new Set(
+                carryoverTerms.map(
+                    (query) =>
+                        cleanText(query)
+                            .toLowerCase(),
+                ),
+            );
+
+
+        const normalTerms =
+            SEARCH_TERMS.filter(
+                (query) =>
+                    !carryoverKeys.has(
+                        cleanText(query)
+                            .toLowerCase(),
+                    ),
+            );
+
+
+        const randomizedCarryover =
+            shuffleArray(
+                carryoverTerms,
+            );
+
+
+        const randomizedNormal =
+            shuffleArray(
+                normalTerms,
+            );
+
+
+        const executionPlan = [
+            ...randomizedCarryover,
+            ...randomizedNormal,
+        ];
+
+        await createSearchRun(
+            runId,
+            executionPlan.length,
+        );
+
+        searchRunCreated = true;
+
+
+        console.log(
+            `♻️ Carryover terms prioritized: ` +
+            `${randomizedCarryover.length}`,
+        );
+
+        console.log(
+            `🔀 Normal terms randomized after carryover: ` +
+            `${randomizedNormal.length}`,
+        );
+
+        console.log(
+            `📋 Final general contracting execution plan: ` +
+            `${executionPlan.length} term(s).`,
+        );
+
+        console.log(
+            "🔀 First 10 terms this run:",
+            executionPlan.slice(0, 10),
+        );
         for (
             let termIndex = 0;
-            termIndex < executionPlan.length;
+            termIndex <
+            executionPlan.length;
             termIndex += 1
         ) {
-            const entry = executionPlan[termIndex];
-            const query = entry.query;
-            const termSource = entry.source;
+            const query =
+                executionPlan[termIndex];
 
             let lastTermResult = null;
 
@@ -3542,36 +3140,30 @@ async function main() {
                 );
             }
 
-            console.log("");
-            console.log("############################################################");
-            console.log(
-                `🔎 SEARCH ${termIndex + 1}/${executionPlan.length}: ` +
-                `"${query}" [${termSource}]`,
-            );
-            printTermHistory(query, strategy.performanceByTerm);
-            console.log("############################################################");
-
             try {
                 const result = await processSearchTerm({
                     context,
                     query,
-                    termSource,
                     runId,
                     seenDuringRun,
                 });
 
                 lastTermResult = result;
 
-                totals.inserted += result.inserted;
-                totals.failed += result.failed;
-                totals.existingSkipped +=
-                    result.existingSkipped;
-                totals.crossTermSkipped +=
-                    result.crossTermSkipped;
-                totals.newCandidates +=
+                totalResultObservations +=
+                    result.resultObservations;
+                totalNewCandidates +=
                     result.newCandidates;
-                totals.resultObservations +=
-                    result.auditRows;
+                totalInserted += result.inserted;
+                totalFailed += result.failed;
+                totalExistingSkipped +=
+                    result.existingSkipped;
+                totalCrossTermSkipped +=
+                    result.crossTermSkipped;
+
+                for (const url of result.observedUrls) {
+                    observedUrlsDuringRun.add(url);
+                }
             } catch (error) {
                 if (
                     browserDisconnected ||
@@ -3580,18 +3172,42 @@ async function main() {
                     throw error;
                 }
 
-                if (isNextdoorThrottleError(error)) {
-                    const message = getErrorMessage(error);
-                    const parts = message.split(":");
-                    const waitSeconds = Number(parts[1] || 0);
+                // Do NOT continue through the remaining search terms
+                // if Nextdoor has rate-limited this session.
+                if (
+                    isNextdoorThrottleError(
+                        error,
+                    )
+                ) {
+                    const message =
+                        getErrorMessage(error);
+
+                    const parts =
+                        message.split(":");
+
+                    const waitSeconds =
+                        Number(parts[1] || 0);
+
+
+                    /*
+                     * Include the currently throttled
+                     * term itself.
+                     *
+                     * We cannot consider that search
+                     * successfully completed.
+                     */
                     const remainingTerms =
-                        executionPlan.slice(termIndex);
+                        executionPlan.slice(
+                            termIndex,
+                        );
+
 
                     console.error(
                         "⛔ Nextdoor throttle detected. " +
-                        "Saving the unfinished general contractor terms " +
+                        "Saving unfinished general contracting terms " +
                         "before stopping this run.",
                     );
+
 
                     if (waitSeconds > 0) {
                         console.error(
@@ -3600,12 +3216,18 @@ async function main() {
                         );
                     }
 
+
                     await saveThrottleCarryover({
                         runId,
-                        throttledTerm: query,
+
+                        throttledTerm:
+                        query,
+
                         waitSeconds,
+
                         remainingTerms,
                     });
+
 
                     throw error;
                 }
@@ -3614,10 +3236,9 @@ async function main() {
                     `⏭️ Skipping search term "${query}" after ` +
                     `fresh-page retries: ${getErrorMessage(error)}`,
                 );
-                totals.failed += 1;
-            }
 
-            totals.uniqueResultUrls = seenDuringRun.size;
+                totalFailed += 1;
+            }
 
             const interTermDelayMs =
                 getAdaptiveTermDelayMs(lastTermResult || {});
@@ -3630,27 +3251,41 @@ async function main() {
             await sleep(interTermDelayMs);
         }
 
+        await finishSearchRun(
+            runId,
+            "completed",
+            currentTotals(),
+        );
+        searchRunFinished = true;
+
+        await clearCarryoverSearchTerms(
+            runId,
+        );
+
         console.log("");
         console.log(
             "============================================================",
         );
-        console.log("✅ Adaptive general contracting scrape finished.");
-        console.log(`   Run ID: ${runId}`);
-        console.log(`   Search terms: ${executionPlan.length}`);
+        console.log("✅ General contracting scrape finished.");
+        console.log(`   Inserted: ${totalInserted}`);
+        console.log(`   Failed: ${totalFailed}`);
         console.log(
-            `   Result observations logged: ${totals.resultObservations}`,
+            `   Existing DB posts skipped: ${totalExistingSkipped}`,
         );
         console.log(
-            `   Unique result URLs: ${totals.uniqueResultUrls}`,
-        );
-        console.log(`   New candidates: ${totals.newCandidates}`);
-        console.log(`   Inserted: ${totals.inserted}`);
-        console.log(`   Failed: ${totals.failed}`);
-        console.log(
-            `   Existing DB posts skipped: ${totals.existingSkipped}`,
+            `   Cross-term duplicates skipped: ${totalCrossTermSkipped}`,
         );
         console.log(
-            `   Cross-term duplicates skipped: ${totals.crossTermSkipped}`,
+            `   Search observations recorded: ${totalResultObservations}`,
+        );
+        console.log(
+            `   Unique result URLs observed: ${observedUrlsDuringRun.size}`,
+        );
+        console.log(
+            `   New candidates observed: ${totalNewCandidates}`,
+        );
+        console.log(
+            `   Learning run ID: ${runId}`,
         );
         console.log(
             `   Async target crashes recovered: ` +
@@ -3660,18 +3295,14 @@ async function main() {
             "============================================================",
         );
 
-        await finishSearchRun(runId, "completed", totals);
-        searchRunFinalized = true;
-
-        await clearCarryoverSearchTerms(runId);
-
-        // The FTN pipeline is unchanged: the scraper still asks the internal
-        // FTN service to run pre_enrichment first, then FamilyTreeNow.
+        // Wait for Railway's FTN trigger server to confirm that the
+        // source table was started, queued, or already running before
+        // this cron container is allowed to exit.
         await triggerFtnEnrichment({
-            totalInserted: totals.inserted,
-            totalFailed: totals.failed,
-            totalExistingSkipped: totals.existingSkipped,
-            totalCrossTermSkipped: totals.crossTermSkipped,
+            totalInserted,
+            totalFailed,
+            totalExistingSkipped,
+            totalCrossTermSkipped,
         });
 
         console.log("");
@@ -3679,18 +3310,18 @@ async function main() {
             "✅ Scrape completed. FTN enrichment request was accepted.",
         );
     } catch (error) {
-        if (!searchRunFinalized) {
+        if (searchRunCreated && !searchRunFinished) {
             await finishSearchRun(
                 runId,
                 isNextdoorThrottleError(error)
                     ? "throttled"
                     : "failed",
-                totals,
+                currentTotals(),
                 getErrorMessage(error),
-            ).catch((finishError) => {
+            ).catch((auditError) => {
                 console.warn(
-                    `⚠️ Could not finalize failed GC search run: ` +
-                    `${getErrorMessage(finishError)}`,
+                    "⚠️ Could not finalize failed learning run: " +
+                    getErrorMessage(auditError),
                 );
             });
         }
@@ -3711,6 +3342,7 @@ async function main() {
         });
 
         if (browser?.isConnected()) {
+            // Close the Playwright CDP connection and Multilogin browser.
             await browser.close().catch((error) => {
                 console.warn(
                     `⚠️ Could not close Multilogin browser: ${error.message}`,
@@ -3725,7 +3357,7 @@ async function main() {
 main()
     .then(async () => {
         console.log(
-            "✅ Adaptive general contracting scraper completed successfully.",
+            "✅ Nextdoor scraper completed successfully.",
         );
         console.log(
             "🛑 Force-terminating scraper process with exit code 0.",
