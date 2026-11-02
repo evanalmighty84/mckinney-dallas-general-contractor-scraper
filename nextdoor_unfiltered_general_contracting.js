@@ -36,7 +36,6 @@ const NEXTDOOR_QUEUE_SCRAPER_NAME =
 
 const MAX_POSTS_PER_TERM = Number(
     process.env.GENERAL_CONTRACTING_MAX_POSTS ||
-    process.env.GENERAL_CONTRACTING_MAX_POSTS ||
     50,
 );
 
@@ -60,7 +59,6 @@ const DETAIL_WEIGHT_DELAY_CAP_MS = Math.max(
     Number(process.env.GC_DETAIL_WEIGHT_DELAY_CAP_MS || 12_000),
 );
 const FALLBACK_STATE =
-    process.env.GENERAL_CONTRACTING_FALLBACK_STATE ||
     process.env.GENERAL_CONTRACTING_FALLBACK_STATE ||
     "TX";
 
